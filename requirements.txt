@@ -1,0 +1,4 @@
+numpy
+pyprobables
+matplotlib
+concrete-python
