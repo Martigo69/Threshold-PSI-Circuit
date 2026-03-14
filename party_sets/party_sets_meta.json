@@ -1,0 +1,7 @@
+{
+  "num_parties": 3,
+  "threshold": 2,
+  "false_positive_rate": 0.0005,
+  "num_common_ips": 1,
+  "party_set_size": 5
+}
