@@ -4,16 +4,96 @@ import os
 import json
 import array
 import time
+import threading
+import sys
 
 import numpy as np
 from probables import BloomFilter
-try:
-    from concrete import fhe
-    _FHE_AVAILABLE = True
-except ModuleNotFoundError:
-    fhe = None  # type: ignore
-    _FHE_AVAILABLE = False
+from concrete import fhe
 import matplotlib.pyplot as plt
+
+
+class _LiveSpinner:
+    """Render a single-line spinner for long blocking steps."""
+
+    def __init__(self, label: str, interval: float = 0.2):
+        self.label = label
+        self.interval = interval
+        self._start = 0.0
+        self._stop_event = threading.Event()
+        self._thread = None
+        self._last_line_len = 0
+
+    def _write_line(self, text: str) -> None:
+        padded = text.ljust(self._last_line_len)
+        self._last_line_len = len(padded)
+        sys.stdout.write("\r" + padded)
+        sys.stdout.flush()
+
+    def _run(self) -> None:
+        frames = "|/-\\"
+        idx = 0
+        while not self._stop_event.wait(self.interval):
+            elapsed = time.perf_counter() - self._start
+            self._write_line(f"[FHE] {self.label} {frames[idx % len(frames)]}  elapsed {elapsed:6.1f}s")
+            idx += 1
+
+    def __enter__(self):
+        self._start = time.perf_counter()
+        self._write_line(f"[FHE] {self.label} ...")
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join()
+        elapsed = time.perf_counter() - self._start
+        status = "done" if exc is None else "failed"
+        self._write_line(f"[FHE] {self.label} {status}  elapsed {elapsed:6.1f}s")
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+
+
+class _LiveProgress:
+    """Render throttled single-line progress for iterative encrypted steps."""
+
+    def __init__(self, label: str, total: int, interval: float = 0.2):
+        self.label = label
+        self.total = max(total, 1)
+        self.interval = interval
+        self._start = time.perf_counter()
+        self._last_render = 0.0
+        self._last_line_len = 0
+
+    def _write_line(self, text: str) -> None:
+        padded = text.ljust(self._last_line_len)
+        self._last_line_len = len(padded)
+        sys.stdout.write("\r" + padded)
+        sys.stdout.flush()
+
+    def update(self, current: int, detail: str = "", force: bool = False) -> None:
+        now = time.perf_counter()
+        if not force and current < self.total and (now - self._last_render) < self.interval:
+            return
+
+        elapsed = now - self._start
+        progress = current / self.total
+        rate = current / elapsed if elapsed > 0 else 0.0
+        eta = (self.total - current) / rate if rate > 0 else float("inf")
+        eta_text = f"{eta:6.1f}s" if eta != float("inf") else "   n/a"
+        detail_text = f"  {detail}" if detail else ""
+        self._write_line(
+            f"[FHE] {self.label} {current}/{self.total} ({progress * 100:5.1f}%)"
+            f"  elapsed {elapsed:6.1f}s  eta {eta_text}{detail_text}"
+        )
+        self._last_render = now
+
+    def finish(self, detail: str = "done") -> None:
+        self.update(self.total, detail=detail, force=True)
+        sys.stdout.write("\n")
+        sys.stdout.flush()
 
 
 # ---------------------------------------------------------------------------
@@ -498,6 +578,7 @@ class ThresholdCircuit:
         try:
             parsed_terms = self._parse_positive_sop_terms(circuit)
             compiler = self._build_concrete_threshold_function(parsed_terms)
+            print(f"[FHE] Parsed {len(parsed_terms)} positive SOP terms for encrypted evaluation.")
 
             # Inputset over binary vectors of length N to infer exact integer ranges.
             inputset = [
@@ -512,9 +593,13 @@ class ThresholdCircuit:
                 )
                 inputset.append(sample)
 
-            compiled = compiler.compile(inputset)
-            compiled.keygen()
+            print(f"[FHE] Prepared inputset with {len(inputset)} binary samples for Concrete compilation.")
+            with _LiveSpinner("Compiling Concrete circuit"):
+                compiled = compiler.compile(inputset)
+            with _LiveSpinner("Generating FHE keys"):
+                compiled.keygen()
             self._compiled_circuits[circuit] = compiled
+            print("[FHE] Concrete circuit context is ready.")
         except Exception as exc:
             raise RuntimeError(
                 "Failed to initialise concrete-python FHE circuit. "
@@ -552,7 +637,13 @@ class ThresholdCircuit:
             raise RuntimeError("No active concrete-python circuit found for decryption.")
 
         compiled = self._active_compiled_circuit
-        return [int(compiled.decrypt(enc_bit)) for enc_bit in ciphertext]
+        progress = _LiveProgress("Decrypting result bits", len(ciphertext))
+        decrypted = []
+        for idx, enc_bit in enumerate(ciphertext, start=1):
+            decrypted.append(int(compiled.decrypt(enc_bit)))
+            progress.update(idx)
+        progress.finish("decryption complete")
+        return decrypted
 
     def evaluate_encrypted_circuit(
         self,
@@ -591,6 +682,7 @@ class ThresholdCircuit:
             raise ValueError("Circuit string is empty  nothing to evaluate.")
 
         encrypted_result = []
+        progress = _LiveProgress("Encrypting and evaluating Bloom bits", bit_count)
         for bit_idx in range(bit_count):
             bit_inputs = np.array(
                 [int(encrypted_bloom_filters[p][bit_idx]) for p in range(self.num_parties)],
@@ -599,6 +691,9 @@ class ThresholdCircuit:
             enc_in = compiled.encrypt(bit_inputs)
             enc_out = compiled.run(enc_in)
             encrypted_result.append(enc_out)
+            progress.update(bit_idx + 1)
+
+        progress.finish("encrypted evaluation complete")
 
         return encrypted_result
 
@@ -806,14 +901,14 @@ def run_scaling_experiments(
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    RUN_SCALING_EXPERIMENTS = True
+    RUN_SCALING_EXPERIMENTS = False
 
     # ---- Parameters --------------------------------------------------------
-    NUM_PARTIES = 5
-    THRESHOLD = 5
+    NUM_PARTIES = 3
+    THRESHOLD = 2
     FALSE_POSITIVE_RATE = 0.0005
     NUM_COMMON_IPS = 5
-    PARTY_SET_SIZE = 10**3
+    PARTY_SET_SIZE = 10**2
 
     # ---- Setup -------------------------------------------------------------
     tc = ThresholdCircuit(
@@ -837,7 +932,7 @@ if __name__ == "__main__":
 
     # ---- Circuit -----------------------------------------------------------
     canonical_circuit = tc.build_canonical_circuit()
-    print(f"\nCanonical circuit: {canonical_circuit}...")
+    print(f"\nCanonical circuit: {canonical_circuit}")
 
     optimized_circuit = tc.optimize_circuit(canonical_circuit)
     print(f"Optimized circuit: {optimized_circuit}")
@@ -858,24 +953,24 @@ if __name__ == "__main__":
     print(f"Exact threshold intersection from plaintext sets: {exact_elements}")
 
     # ---- Concrete-python encrypted evaluation (temporarily disabled) ------
-    # print("\n--- Concrete-Python Encrypted Evaluation ---")
-    # try:
-    #     encrypted_bloom_filters = [
-    #         tc.encrypt_bloom_filter(bf) for bf in bloom_filters
-    #     ]
-    #     encrypted_result = tc.evaluate_encrypted_circuit(
-    #         optimized_circuit, encrypted_bloom_filters
-    #     )
-    #     decrypted_result = tc.decrypt_bloom_filter(encrypted_result)
-    #     print(f"Decrypted result (first 30 bits): {decrypted_result[:30]}")
-    #     matches = decrypted_result == plaintext_result
-    #     print(f"Matches plaintext result: {matches}")
-    #     recovered_candidates = tc.extract_candidates_from_intersection_bloom(
-    #         decrypted_result, party_sets,
-    #     )
-    #     print(f"Recovered candidates from decrypted bloom filter: {recovered_candidates}")
-    # except RuntimeError as exc:
-    #     print(f"Concrete-python FHE unavailable on this machine: {exc}")
+    print("\n--- Concrete-Python Encrypted Evaluation ---")
+    try:
+        encrypted_bloom_filters = [
+            tc.encrypt_bloom_filter(bf) for bf in bloom_filters
+        ]
+        encrypted_result = tc.evaluate_encrypted_circuit(
+            optimized_circuit, encrypted_bloom_filters
+        )
+        decrypted_result = tc.decrypt_bloom_filter(encrypted_result)
+        print(f"Decrypted result (first 30 bits): {decrypted_result[:30]}")
+        matches = decrypted_result == plaintext_result
+        print(f"Matches plaintext result: {matches}")
+        recovered_candidates = tc.extract_candidates_from_intersection_bloom(
+            decrypted_result, party_sets,
+        )
+        print(f"Recovered candidates from decrypted bloom filter: {recovered_candidates}")
+    except RuntimeError as exc:
+        print(f"Concrete-python FHE unavailable on this machine: {exc}")
 
     if RUN_SCALING_EXPERIMENTS:
         print("\n--- Scaling Experiments ---")
