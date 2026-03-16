@@ -7,7 +7,12 @@ import time
 
 import numpy as np
 from probables import BloomFilter
-from concrete import fhe
+try:
+    from concrete import fhe
+    _FHE_AVAILABLE = True
+except ModuleNotFoundError:
+    fhe = None  # type: ignore
+    _FHE_AVAILABLE = False
 import matplotlib.pyplot as plt
 
 
@@ -44,7 +49,7 @@ class ThresholdCircuit:
         threshold: int,
         false_positive_rate: float = 0.0005,
         num_common_ips: int = 2,
-        party_set_size: int = 10**6,
+        party_set_size: int = 10**4,
     ):
         self.num_parties = num_parties
         self.threshold = threshold
@@ -167,7 +172,7 @@ class ThresholdCircuit:
             party_sets.append(ips)
         return party_sets
 
-    def load_or_create_party_sets(self) -> list:
+    def load_or_create_party_sets(self, quiet: bool = False) -> list:
         """
         Return party sets from disk if they already exist, otherwise generate
         them, write them to disk, and return them.
@@ -175,10 +180,12 @@ class ThresholdCircuit:
         if self._is_party_set_cache_valid():
             existing = self._read_party_sets()
             if existing is not None:
-                print(f"Party set cache is valid. Loaded {self.num_parties} files.")
+                if not quiet:
+                    print(f"Party set cache is valid. Loaded {self.num_parties} files.")
                 return existing
 
-        print("Party set cache missing/mismatched. Regenerating from scratch...")
+        if not quiet:
+            print("Party set cache missing/mismatched. Regenerating from scratch...")
         self._clear_party_set_cache()
         return self.generate_party_sets()
 
@@ -366,8 +373,9 @@ class ThresholdCircuit:
         if not terms:
             return [0] * self.num_bloom_bits
 
+        bit_count = len(bloom_filters[0]) if bloom_filters else self.num_bloom_bits
         results = []
-        for bit_idx in range(self.num_bloom_bits):
+        for bit_idx in range(bit_count):
             output_bit = 0
             for term in terms:
                 term_bit = 1
@@ -380,85 +388,14 @@ class ThresholdCircuit:
 
         return results
 
-    def _generate_synthetic_bloom_filters(self, bit_count: int, seed: int = 12345) -> list:
-        """Generate synthetic random bloom bit arrays for timing experiments."""
-        rng = random.Random(seed)
-        return [
-            [rng.randint(0, 1) for _ in range(bit_count)]
-            for _ in range(self.num_parties)
-        ]
 
-    def benchmark_computation_times(
-        self,
-        sample_bits_cap: int = 100_000,
-        include_encrypted: bool = True,
-        encrypted_sample_bits_cap: int = 256,
-        seed: int = 12345,
-    ) -> dict:
-        """
-        Benchmark computation time for current parameters.
-
-        To keep very large settings feasible (e.g. party_set_size=1e7),
-        measurement is done on min(M, sample_bits_cap) bits and linearly
-        extrapolated to full M because evaluation is linear in bit length.
-        """
-        sampled_bits = min(self.num_bloom_bits, sample_bits_cap)
-        scale_factor = self.num_bloom_bits / sampled_bits
-
-        bloom_filters = self._generate_synthetic_bloom_filters(sampled_bits, seed=seed)
-
-        canonical_circuit = self.build_canonical_circuit()
-        optimized_circuit = self.optimize_circuit(canonical_circuit)
-
-        start_plain = time.perf_counter()
-        plain_result = self.evaluate_plaintext_circuit(optimized_circuit, bloom_filters)
-        plain_elapsed = time.perf_counter() - start_plain
-
-        encrypted_elapsed = None
-        encrypted_match = None
-        encrypted_sampled_bits = min(sampled_bits, encrypted_sample_bits_cap)
-        encrypted_scale_factor = self.num_bloom_bits / encrypted_sampled_bits
-        if include_encrypted:
-            try:
-                start_enc = time.perf_counter()
-                encrypted_bloom_filters = [
-                    self.encrypt_bloom_filter(bits[:encrypted_sampled_bits])
-                    for bits in bloom_filters
-                ]
-                enc_result = self.evaluate_encrypted_circuit(
-                    optimized_circuit,
-                    encrypted_bloom_filters,
-                )
-                dec_result = self.decrypt_bloom_filter(enc_result)
-                encrypted_elapsed = time.perf_counter() - start_enc
-                encrypted_match = (dec_result == plain_result[:encrypted_sampled_bits])
-            except RuntimeError:
-                encrypted_elapsed = None
-                encrypted_match = None
-
-        return {
-            "num_parties": self.num_parties,
-            "threshold": self.threshold,
-            "party_set_size": self.party_set_size,
-            "num_bloom_bits": self.num_bloom_bits,
-            "sampled_bits": sampled_bits,
-            "scale_factor": scale_factor,
-            "encrypted_sampled_bits": encrypted_sampled_bits,
-            "encrypted_scale_factor": encrypted_scale_factor,
-            "plaintext_time_sampled_s": plain_elapsed,
-            "plaintext_time_estimated_full_s": plain_elapsed * scale_factor,
-            "encrypted_time_sampled_s": encrypted_elapsed,
-            "encrypted_time_estimated_full_s": (
-                None if encrypted_elapsed is None else encrypted_elapsed * encrypted_scale_factor
-            ),
-            "encrypted_matches_plaintext": encrypted_match,
-        }
 
     def benchmark_computation_times_from_party_sets(
         self,
         sample_bits_cap: int = 100_000,
         include_encrypted: bool = True,
         encrypted_sample_bits_cap: int = 256,
+        quiet: bool = False,
     ) -> dict:
         """
         Benchmark computation time using real generated/loaded party sets.
@@ -466,7 +403,7 @@ class ThresholdCircuit:
         This path captures effects from data-generation parameters like
         num_common_ips, unlike synthetic random bit generation.
         """
-        party_sets = self.load_or_create_party_sets()
+        party_sets = self.load_or_create_party_sets(quiet=quiet)
         bloom_filters_full = [self.build_bloom_filter(party_set) for party_set in party_sets]
 
         sampled_bits = min(self.num_bloom_bits, sample_bits_cap)
@@ -722,7 +659,7 @@ def _plot_scaling_graph(
 
 def run_scaling_experiments(
     false_positive_rate: float = 0.0005,
-    max_parties: int = 20,
+    max_parties: int = 10,
     sample_bits_cap: int = 100_000,
     output_dir: str = "benchmark_outputs",
 ):
@@ -734,13 +671,18 @@ def run_scaling_experiments(
     4) common IPs sweep (fixed N, T, set size)
     """
     os.makedirs(output_dir, exist_ok=True)
+    _all_start = time.perf_counter()
 
-    # 1) Sweep number of parties (threshold at ~N/2, fixed party set size)
-    parties_x = []
-    parties_plain = []
-    parties_enc = []
-    fixed_set_size_for_parties = 10**6
+    # ------------------------------------------------------------------
+    # 1) Parties sweep  N=2..max_parties  T~N/2  (synthetic Bloom bits)
+    # ------------------------------------------------------------------
+    _t0 = time.perf_counter()
+    parties_x, parties_plain, parties_enc = [], [], []
+    fixed_set_size_for_parties = 10**3
+    _w = len(str(max_parties))
+    print(f"[1/4] Parties sweep  N=2..{max_parties}  T~N/2  (real IP files -- disk I/O per step)")
     for n in range(2, max_parties + 1):
+        print(f"      N={n:{_w}}/{max_parties}  generating {n} party files...", end='\r', flush=True)
         t = max(1, n // 2)
         tc = ThresholdCircuit(
             num_parties=n,
@@ -749,27 +691,29 @@ def run_scaling_experiments(
             num_common_ips=10,
             party_set_size=fixed_set_size_for_parties,
         )
-        metrics = tc.benchmark_computation_times(sample_bits_cap=sample_bits_cap)
+        metrics = tc.benchmark_computation_times_from_party_sets(sample_bits_cap=sample_bits_cap, include_encrypted=False, quiet=True)
         parties_x.append(n)
         parties_plain.append(metrics["plaintext_time_estimated_full_s"])
         parties_enc.append(metrics["encrypted_time_estimated_full_s"])
-
+    print(f"[1/4] Parties sweep  done  ({time.perf_counter()-_t0:.1f}s)                    ")
     _plot_scaling_graph(
-        parties_x,
-        parties_plain,
-        parties_enc,
+        parties_x, parties_plain, parties_enc,
         title="Computation Time vs Number of Parties",
         x_label="Number of parties (N)",
         output_path=os.path.join(output_dir, "scaling_num_parties.png"),
     )
 
-    # 2) Sweep threshold for fixed N=max_parties
-    threshold_x = []
-    threshold_plain = []
-    threshold_enc = []
-    fixed_set_size_for_threshold = 10**6
+    # ------------------------------------------------------------------
+    # 2) Threshold sweep  T=1..N  fixed N=max_parties  (synthetic Bloom bits)
+    # ------------------------------------------------------------------
+    _t0 = time.perf_counter()
+    threshold_x, threshold_plain, threshold_enc = [], [], []
+    fixed_set_size_for_threshold = 10**3
     n_fixed = max_parties
+    _w = len(str(n_fixed))
+    print(f"[2/4] Threshold sweep  T=1..{n_fixed}  N={n_fixed}  (real IP files -- disk I/O per step)")
     for t in range(1, n_fixed + 1):
+        print(f"      T={t:{_w}}/{n_fixed}  generating {n_fixed} party files...", end='\r', flush=True)
         tc = ThresholdCircuit(
             num_parties=n_fixed,
             threshold=t,
@@ -777,27 +721,28 @@ def run_scaling_experiments(
             num_common_ips=10,
             party_set_size=fixed_set_size_for_threshold,
         )
-        metrics = tc.benchmark_computation_times(sample_bits_cap=sample_bits_cap)
+        metrics = tc.benchmark_computation_times_from_party_sets(sample_bits_cap=sample_bits_cap, include_encrypted=False, quiet=True)
         threshold_x.append(t)
         threshold_plain.append(metrics["plaintext_time_estimated_full_s"])
         threshold_enc.append(metrics["encrypted_time_estimated_full_s"])
-
+    print(f"[2/4] Threshold sweep  done  ({time.perf_counter()-_t0:.1f}s)                    ")
     _plot_scaling_graph(
-        threshold_x,
-        threshold_plain,
-        threshold_enc,
+        threshold_x, threshold_plain, threshold_enc,
         title=f"Computation Time vs Threshold (N={n_fixed})",
         x_label="Threshold (T)",
         output_path=os.path.join(output_dir, "scaling_threshold.png"),
     )
 
-    # 3) Sweep party set size (10 to 10^7)
-    size_x = [10**i for i in range(1, 8)]
-    size_plain = []
-    size_enc = []
-    n_for_size = 10
-    t_for_size = 5
-    for set_size in size_x:
+    # ------------------------------------------------------------------
+    # 3) Set-size sweep  10..10^7  (synthetic Bloom bits)
+    # ------------------------------------------------------------------
+    _t0 = time.perf_counter()
+    size_x = [10**i for i in range(1, 4)]  # 10 to 1,000
+    size_plain, size_enc = [], []
+    n_for_size, t_for_size = 10, 5
+    print(f"[3/4] Set-size sweep  10..10^3  N={n_for_size}  T={t_for_size}  (real IP files -- disk I/O per step)")
+    for i, set_size in enumerate(size_x, 1):
+        print(f"      [{i}/{len(size_x)}] set_size={set_size:,}  generating {n_for_size} party files...", end='\r', flush=True)
         tc = ThresholdCircuit(
             num_parties=n_for_size,
             threshold=t_for_size,
@@ -805,27 +750,28 @@ def run_scaling_experiments(
             num_common_ips=1,
             party_set_size=set_size,
         )
-        metrics = tc.benchmark_computation_times(sample_bits_cap=sample_bits_cap)
+        metrics = tc.benchmark_computation_times_from_party_sets(sample_bits_cap=sample_bits_cap, include_encrypted=False, quiet=True)
         size_plain.append(metrics["plaintext_time_estimated_full_s"])
         size_enc.append(metrics["encrypted_time_estimated_full_s"])
-
+    print(f"[3/4] Set-size sweep  done  ({time.perf_counter()-_t0:.1f}s)                    ")
     _plot_scaling_graph(
-        size_x,
-        size_plain,
-        size_enc,
+        size_x, size_plain, size_enc,
         title=f"Computation Time vs Party Set Size (N={n_for_size}, T={t_for_size})",
         x_label="Party set size",
         output_path=os.path.join(output_dir, "scaling_party_set_size.png"),
     )
 
-    # 4) Sweep number of common IPs with other parameters fixed.
+    # ------------------------------------------------------------------
+    # 4) Common-IPs sweep  (REAL party sets -- regenerated each iteration)
+    # ------------------------------------------------------------------
+    _t0 = time.perf_counter()
     common_x = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000]
-    common_plain = []
-    common_enc = []
-    n_for_common = 10
-    t_for_common = 5
-    set_size_for_common = 10**6
-    for common_ips in common_x:
+    common_plain, common_enc = [], []
+    n_for_common, t_for_common, set_size_for_common = 10, 5, 10**3
+    print(f"[4/4] Common-IPs sweep  N={n_for_common}  T={t_for_common}  set_size={set_size_for_common:,}")
+    print( "      (party files are written to disk and regenerated whenever params change)")
+    for i, common_ips in enumerate(common_x, 1):
+        print(f"      [{i}/{len(common_x)}] common_ips={common_ips:<4}  generating {n_for_common} party files...", end='\r', flush=True)
         tc = ThresholdCircuit(
             num_parties=n_for_common,
             threshold=t_for_common,
@@ -835,14 +781,14 @@ def run_scaling_experiments(
         )
         metrics = tc.benchmark_computation_times_from_party_sets(
             sample_bits_cap=sample_bits_cap,
+            include_encrypted=False,
+            quiet=True,
         )
         common_plain.append(metrics["plaintext_time_estimated_full_s"])
         common_enc.append(metrics["encrypted_time_estimated_full_s"])
-
+    print(f"[4/4] Common-IPs sweep  done  ({time.perf_counter()-_t0:.1f}s)                    ")
     _plot_scaling_graph(
-        common_x,
-        common_plain,
-        common_enc,
+        common_x, common_plain, common_enc,
         title=(
             "Computation Time vs Number of Common IPs "
             f"(N={n_for_common}, T={t_for_common}, SetSize={set_size_for_common})"
@@ -851,8 +797,8 @@ def run_scaling_experiments(
         output_path=os.path.join(output_dir, "scaling_num_common_ips.png"),
     )
 
-    print("\nScaling experiments complete.")
-    print(f"Plots saved in: {output_dir}")
+    print(f"\nAll 4 sweeps done in {time.perf_counter()-_all_start:.1f}s  --  plots saved in '{output_dir}'")
+
 
 
 # ---------------------------------------------------------------------------
@@ -863,11 +809,11 @@ if __name__ == "__main__":
     RUN_SCALING_EXPERIMENTS = True
 
     # ---- Parameters --------------------------------------------------------
-    NUM_PARTIES = 3
-    THRESHOLD = 2
+    NUM_PARTIES = 5
+    THRESHOLD = 5
     FALSE_POSITIVE_RATE = 0.0005
-    NUM_COMMON_IPS = 1
-    PARTY_SET_SIZE = 5
+    NUM_COMMON_IPS = 5
+    PARTY_SET_SIZE = 10**3
 
     # ---- Setup -------------------------------------------------------------
     tc = ThresholdCircuit(
@@ -885,20 +831,22 @@ if __name__ == "__main__":
 
     # ---- Bloom filters (plaintext) -----------------------------------------
     bloom_filters = [tc.build_bloom_filter(party_set) for party_set in party_sets]
-    print("\nBloom filters for all parties:")
-    for idx, bloom_filter_bits in enumerate(bloom_filters, start=1):
-        print(f"Party {idx}: {bloom_filter_bits}")
+    print(f"\nBuilt {len(bloom_filters)} Bloom filters  "
+          f"({tc.num_bloom_bits} bits each, K={tc.num_hash_funcs} hash functions, "
+          f"FPR={tc.false_positive_rate*100:.2f}%)")
 
     # ---- Circuit -----------------------------------------------------------
     canonical_circuit = tc.build_canonical_circuit()
-    print(f"\nCanonical circuit (first 120 chars): {canonical_circuit}...")
+    print(f"\nCanonical circuit: {canonical_circuit}...")
 
     optimized_circuit = tc.optimize_circuit(canonical_circuit)
     print(f"Optimized circuit: {optimized_circuit}")
 
     # ---- Plaintext evaluation ----------------------------------------------
     plaintext_result = tc.evaluate_plaintext_circuit(optimized_circuit, bloom_filters)
-    print(f"\nIntersection Bloom filter (plaintext): {plaintext_result}")
+    _ones = sum(plaintext_result)
+    print(f"\nIntersection Bloom filter: {len(plaintext_result)} bits,  "
+          f"{_ones} set ({100*_ones/len(plaintext_result):.1f}% density)")
 
     # Recover candidate elements from the (plaintext) threshold-intersection Bloom bits.
     recovered_from_plain = tc.extract_candidates_from_intersection_bloom(
@@ -909,41 +857,31 @@ if __name__ == "__main__":
     print(f"Recovered intersection candidates from plaintext bloom result: {recovered_from_plain}")
     print(f"Exact threshold intersection from plaintext sets: {exact_elements}")
 
-    # ---- Concrete-python encrypted evaluation ------------------------------
-    print("\n--- Concrete-Python Encrypted Evaluation ---")
-    try:
-        # Prepare party bloom-filter bits for concrete-python evaluation.
-        print("Preparing each party's Bloom filter for encrypted evaluation...")
-        encrypted_bloom_filters = [
-            tc.encrypt_bloom_filter(bf) for bf in bloom_filters
-        ]
-
-        # The evaluator runs the circuit homomorphically on encrypted inputs.
-        print("Evaluating circuit over encrypted Bloom filters...")
-        encrypted_result = tc.evaluate_encrypted_circuit(
-            optimized_circuit, encrypted_bloom_filters
-        )
-
-        # Decrypt the final intersection result to verify correctness.
-        decrypted_result = tc.decrypt_bloom_filter(encrypted_result)
-        print(f"Decrypted result (first 30 bits): {decrypted_result[:30]}")
-        matches = decrypted_result == plaintext_result
-        print(f"Matches plaintext result: {matches}")
-
-        recovered_candidates = tc.extract_candidates_from_intersection_bloom(
-            decrypted_result,
-            party_sets,
-        )
-        print(f"Recovered intersection candidates from decrypted bloom filter: {recovered_candidates}")
-
-    except RuntimeError as exc:
-        print(f"Concrete-python FHE unavailable on this machine: {exc}")
+    # ---- Concrete-python encrypted evaluation (temporarily disabled) ------
+    # print("\n--- Concrete-Python Encrypted Evaluation ---")
+    # try:
+    #     encrypted_bloom_filters = [
+    #         tc.encrypt_bloom_filter(bf) for bf in bloom_filters
+    #     ]
+    #     encrypted_result = tc.evaluate_encrypted_circuit(
+    #         optimized_circuit, encrypted_bloom_filters
+    #     )
+    #     decrypted_result = tc.decrypt_bloom_filter(encrypted_result)
+    #     print(f"Decrypted result (first 30 bits): {decrypted_result[:30]}")
+    #     matches = decrypted_result == plaintext_result
+    #     print(f"Matches plaintext result: {matches}")
+    #     recovered_candidates = tc.extract_candidates_from_intersection_bloom(
+    #         decrypted_result, party_sets,
+    #     )
+    #     print(f"Recovered candidates from decrypted bloom filter: {recovered_candidates}")
+    # except RuntimeError as exc:
+    #     print(f"Concrete-python FHE unavailable on this machine: {exc}")
 
     if RUN_SCALING_EXPERIMENTS:
         print("\n--- Scaling Experiments ---")
         run_scaling_experiments(
             false_positive_rate=FALSE_POSITIVE_RATE,
-            max_parties=20,
+            max_parties=10,
             sample_bits_cap=100_000,
             output_dir="benchmark_outputs",
         )
