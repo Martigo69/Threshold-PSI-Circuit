@@ -6,6 +6,7 @@ import array
 import time
 import threading
 import sys
+import hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
@@ -121,8 +122,9 @@ class ThresholdCircuit:
         Number of IPs in each party's full set.
     """
 
-    PARTY_SETS_DIR = "party_sets_bloom"
+    PARTY_SETS_DIR = "party_sets_menu"
     PARTY_SETS_META_FILE = "party_sets_meta.json"
+    BLOOM_META_FILE = "bloom_meta.json"
 
     def __init__(
         self,
@@ -148,6 +150,23 @@ class ThresholdCircuit:
         self._bits_per_chunk = int(_template._bits_per_elm)
         self._bloom_typecode = _template.bloom.typecode
 
+    def _dataset_tag(self) -> str:
+        return (
+            f"n{self.num_parties}_t{self.threshold}_"
+            f"c{self.num_common_ips}_s{self.party_set_size}"
+        )
+
+    def _dataset_dir(self) -> str:
+        return os.path.join(self.PARTY_SETS_DIR, self._dataset_tag())
+
+    def _bloom_cache_name(self) -> str:
+        fpr_token = str(self.false_positive_rate).replace(".", "p")
+        return f"bloom_fpr_{fpr_token}.npz"
+
+    def _bloom_meta_name(self) -> str:
+        fpr_token = str(self.false_positive_rate).replace(".", "p")
+        return f"bloom_meta_fpr_{fpr_token}.json"
+
     # ------------------------------------------------------------------
     # Data layer  party set persistence
     # ------------------------------------------------------------------
@@ -162,15 +181,15 @@ class ThresholdCircuit:
 
     def _write_party_sets(self, party_sets: list) -> None:
         """Persist party_sets to individual text files (one IP per line)."""
-        os.makedirs(self.PARTY_SETS_DIR, exist_ok=True)
+        os.makedirs(self._dataset_dir(), exist_ok=True)
         for idx, party_set in enumerate(party_sets):
-            file_path = os.path.join(self.PARTY_SETS_DIR, f"party_{idx + 1}.txt")
+            file_path = os.path.join(self._dataset_dir(), f"party_{idx + 1}.txt")
             with open(file_path, "w") as fh:
                 for ip in party_set:
                     fh.write(ip + "\n")
 
     def _party_set_metadata_path(self) -> str:
-        return os.path.join(self.PARTY_SETS_DIR, self.PARTY_SETS_META_FILE)
+        return os.path.join(self._dataset_dir(), self.PARTY_SETS_META_FILE)
 
     def _current_party_set_metadata(self) -> dict:
         return {
@@ -182,16 +201,9 @@ class ThresholdCircuit:
         }
 
     def _write_party_set_metadata(self) -> None:
-        os.makedirs(self.PARTY_SETS_DIR, exist_ok=True)
-        metadata = {}
-        if os.path.exists(self._party_set_metadata_path()):
-            with open(self._party_set_metadata_path(), "r") as fh:
-                existing = json.load(fh)
-            if isinstance(existing, dict):
-                metadata.update(existing)
-        metadata.update(self._current_party_set_metadata())
+        os.makedirs(self._dataset_dir(), exist_ok=True)
         with open(self._party_set_metadata_path(), "w") as fh:
-            json.dump(metadata, fh, indent=2)
+            json.dump(self._current_party_set_metadata(), fh, indent=2)
 
     def _read_party_set_metadata(self):
         path = self._party_set_metadata_path()
@@ -201,30 +213,192 @@ class ThresholdCircuit:
             return json.load(fh)
 
     def _party_set_file_paths(self) -> list:
-        if not os.path.exists(self.PARTY_SETS_DIR):
+        dataset_dir = self._dataset_dir()
+        if not os.path.exists(dataset_dir):
             return []
         files = []
-        for name in os.listdir(self.PARTY_SETS_DIR):
+        for name in os.listdir(dataset_dir):
             if name.startswith("party_") and name.endswith(".txt"):
-                files.append(os.path.join(self.PARTY_SETS_DIR, name))
+                files.append(os.path.join(dataset_dir, name))
         return sorted(files)
+
+    def _read_metadata_from_dir(self, dataset_dir: str):
+        meta_path = os.path.join(dataset_dir, self.PARTY_SETS_META_FILE)
+        if not os.path.exists(meta_path):
+            return None
+        with open(meta_path, "r") as fh:
+            return json.load(fh)
+
+    def _read_party_sets_from_dir(self, dataset_dir: str, num_parties: int):
+        expected_files = [
+            os.path.join(dataset_dir, f"party_{i + 1}.txt")
+            for i in range(num_parties)
+        ]
+        if not all(os.path.exists(path) for path in expected_files):
+            return None
+
+        party_sets = []
+        for file_path in expected_files:
+            with open(file_path, "r") as fh:
+                party_sets.append([line.strip() for line in fh if line.strip()])
+        return party_sets
+
+    def _item_counts(self, party_sets: list) -> dict:
+        counts = {}
+        for party in party_sets:
+            for item in set(party):
+                counts[item] = counts.get(item, 0) + 1
+        return counts
+
+    def _validate_party_sets_shape(self, party_sets: list) -> bool:
+        if len(party_sets) != self.num_parties:
+            return False
+        if any(len(party) != self.party_set_size for party in party_sets):
+            return False
+
+        counts = self._item_counts(party_sets)
+        if self.threshold == 1:
+            return all(count == 1 for count in counts.values())
+
+        shared_count = sum(1 for count in counts.values() if count == self.threshold)
+        allowed_counts = all(count in (1, self.threshold) for count in counts.values())
+        return shared_count == self.num_common_ips and allowed_counts
+
+    def _find_adaptation_source(self):
+        if not os.path.exists(self.PARTY_SETS_DIR):
+            return None
+
+        candidates = []
+        for name in os.listdir(self.PARTY_SETS_DIR):
+            dataset_dir = os.path.join(self.PARTY_SETS_DIR, name)
+            if not os.path.isdir(dataset_dir):
+                continue
+            metadata = self._read_metadata_from_dir(dataset_dir)
+            if metadata is None:
+                continue
+            if metadata.get("num_parties") != self.num_parties:
+                continue
+            if metadata.get("threshold") != self.threshold:
+                continue
+
+            score = (
+                abs(metadata.get("party_set_size", 0) - self.party_set_size),
+                abs(metadata.get("num_common_ips", 0) - self.num_common_ips),
+            )
+            candidates.append((score, dataset_dir, metadata))
+
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda item: item[0])
+        _, dataset_dir, metadata = candidates[0]
+        return dataset_dir, metadata
+
+    def _adjust_common_ips_minimally(self, party_sets: list, used_ips: set) -> bool:
+        if self.threshold == 1:
+            return True
+
+        counts = self._item_counts(party_sets)
+        current_shared = sorted([item for item, count in counts.items() if count == self.threshold])
+
+        if len(current_shared) > self.num_common_ips:
+            for item in current_shared[self.num_common_ips:]:
+                owners = [idx for idx, party in enumerate(party_sets) if item in party]
+                for owner in owners:
+                    party_sets[owner].remove(item)
+                    party_sets[owner].add(self._random_unique_ip(used_ips))
+
+        elif len(current_shared) < self.num_common_ips:
+            deficit = self.num_common_ips - len(current_shared)
+            for _ in range(deficit):
+                shared_ip = self._random_unique_ip(used_ips)
+                owners = random.sample(range(self.num_parties), self.threshold)
+                for owner in owners:
+                    party_sets[owner].add(shared_ip)
+
+        return True
+
+    def _adjust_party_size_minimally(self, party_sets: list, used_ips: set) -> bool:
+        for party in party_sets:
+            while len(party) < self.party_set_size:
+                party.add(self._random_unique_ip(used_ips))
+
+        for party in party_sets:
+            while len(party) > self.party_set_size:
+                counts = self._item_counts(party_sets)
+                removable = next((item for item in sorted(party) if counts.get(item) == 1), None)
+                if removable is None:
+                    return False
+                party.remove(removable)
+
+        return True
+
+    def _adapt_party_sets(self, party_sets: list) -> list:
+        adapted = [set(party) for party in party_sets]
+        used_ips = {item for party in adapted for item in party}
+
+        if not self._adjust_common_ips_minimally(adapted, used_ips):
+            raise RuntimeError("Unable to adjust common IPs minimally for requested parameters.")
+        if not self._adjust_party_size_minimally(adapted, used_ips):
+            raise RuntimeError("Unable to adjust party sizes minimally for requested parameters.")
+
+        sorted_sets = [sorted(party) for party in adapted]
+        if not self._validate_party_sets_shape(sorted_sets):
+            raise RuntimeError("Adjusted input files do not satisfy the requested parameters.")
+        return sorted_sets
+
+    def _party_sets_digest(self, party_sets: list) -> str:
+        hasher = hashlib.sha256()
+        for party in party_sets:
+            for ip in party:
+                hasher.update(ip.encode("ascii"))
+                hasher.update(b"\n")
+            hasher.update(b"--party--\n")
+        return hasher.hexdigest()
+
+    def _bloom_cache_paths(self) -> tuple:
+        dataset_dir = self._dataset_dir()
+        return (
+            os.path.join(dataset_dir, self._bloom_cache_name()),
+            os.path.join(dataset_dir, self._bloom_meta_name()),
+        )
+
+    def _bloom_cache_metadata(self, party_sets: list) -> dict:
+        return {
+            "false_positive_rate": self.false_positive_rate,
+            "num_bloom_bits": self.num_bloom_bits,
+            "num_hash_funcs": self.num_hash_funcs,
+            "party_sets_digest": self._party_sets_digest(party_sets),
+        }
+
+    def _is_bloom_cache_valid(self, party_sets: list) -> bool:
+        data_path, meta_path = self._bloom_cache_paths()
+        if not (os.path.exists(data_path) and os.path.exists(meta_path)):
+            return False
+        with open(meta_path, "r") as fh:
+            metadata = json.load(fh)
+        return metadata == self._bloom_cache_metadata(party_sets)
+
+    def _load_cached_bloom_filters(self) -> list:
+        data_path, _ = self._bloom_cache_paths()
+        matrix = np.load(data_path, allow_pickle=False)["bloom_filters"]
+        return matrix.astype(np.int64).tolist()
+
+    def _write_bloom_cache(self, party_sets: list, bloom_filters: list) -> None:
+        data_path, meta_path = self._bloom_cache_paths()
+        np.savez_compressed(data_path, bloom_filters=np.array(bloom_filters, dtype=np.uint8))
+        with open(meta_path, "w") as fh:
+            json.dump(self._bloom_cache_metadata(party_sets), fh, indent=2)
 
     def _is_party_set_cache_valid(self) -> bool:
         # Validate metadata first (parameter-level compatibility check).
         metadata = self._read_party_set_metadata()
-        if not isinstance(metadata, dict):
-            return False
-        for key, value in self._current_party_set_metadata().items():
-            if metadata.get(key) != value:
-                return False
-
-        # Old file layout has no explicit mode marker, so accept legacy metadata.
-        if metadata.get("script_mode") not in (None, "bloom"):
+        if metadata != self._current_party_set_metadata():
             return False
 
         # Validate file count and expected names.
         expected_files = {
-            os.path.join(self.PARTY_SETS_DIR, f"party_{i + 1}.txt")
+            os.path.join(self._dataset_dir(), f"party_{i + 1}.txt")
             for i in range(self.num_parties)
         }
         actual_files = set(self._party_set_file_paths())
@@ -241,10 +415,11 @@ class ThresholdCircuit:
         return True
 
     def _clear_party_set_cache(self) -> None:
-        if not os.path.exists(self.PARTY_SETS_DIR):
+        dataset_dir = self._dataset_dir()
+        if not os.path.exists(dataset_dir):
             return
-        for name in os.listdir(self.PARTY_SETS_DIR):
-            path = os.path.join(self.PARTY_SETS_DIR, name)
+        for name in os.listdir(dataset_dir):
+            path = os.path.join(dataset_dir, name)
             if os.path.isfile(path):
                 os.remove(path)
 
@@ -254,7 +429,7 @@ class ThresholdCircuit:
         Returns a list of IP-address lists, or None if any file is missing.
         """
         expected_files = [
-            os.path.join(self.PARTY_SETS_DIR, f"party_{i + 1}.txt")
+            os.path.join(self._dataset_dir(), f"party_{i + 1}.txt")
             for i in range(self.num_parties)
         ]
         if not all(os.path.exists(p) for p in expected_files):
@@ -276,13 +451,56 @@ class ThresholdCircuit:
             existing = self._read_party_sets()
             if existing is not None:
                 if not quiet:
-                    print(f"Party set cache is valid. Loaded {self.num_parties} files.")
+                    print(
+                        f"Party set cache is valid for '{self._dataset_tag()}'. "
+                        f"Loaded {self.num_parties} files."
+                    )
                 return existing
 
+        source = self._find_adaptation_source()
+        if source is not None:
+            source_dir, source_meta = source
+            source_sets = self._read_party_sets_from_dir(
+                source_dir,
+                source_meta["num_parties"],
+            )
+            if source_sets is not None:
+                try:
+                    if not quiet:
+                        print(
+                            f"Adapting cached input files from '{os.path.basename(source_dir)}' "
+                            f"to '{self._dataset_tag()}'."
+                        )
+                    adapted_sets = self._adapt_party_sets(source_sets)
+                    self._clear_party_set_cache()
+                    self._write_party_sets(adapted_sets)
+                    self._write_party_set_metadata()
+                    return adapted_sets
+                except RuntimeError:
+                    pass
+
         if not quiet:
-            print("Party set cache missing/mismatched. Regenerating from scratch...")
+            print(
+                f"Party set cache missing/mismatched for '{self._dataset_tag()}'. "
+                "Regenerating from scratch..."
+            )
         self._clear_party_set_cache()
         return self.generate_party_sets()
+
+    def load_or_build_bloom_filters(self, party_sets: list, quiet: bool = False) -> list:
+        """Load Bloom filters from disk when valid, otherwise build and persist them."""
+        os.makedirs(self._dataset_dir(), exist_ok=True)
+        if self._is_bloom_cache_valid(party_sets):
+            bloom_filters = self._load_cached_bloom_filters()
+            if not quiet:
+                print(f"Bloom cache is valid for '{self._dataset_tag()}'. Loaded from disk.")
+            return bloom_filters
+
+        if not quiet:
+            print(f"Bloom cache missing/mismatched for '{self._dataset_tag()}'. Rebuilding...")
+        bloom_filters = [self.build_bloom_filter(party_set) for party_set in party_sets]
+        self._write_bloom_cache(party_sets, bloom_filters)
+        return bloom_filters
 
     def generate_party_sets(self) -> list:
         """
@@ -499,7 +717,7 @@ class ThresholdCircuit:
         num_common_ips, unlike synthetic random bit generation.
         """
         party_sets = self.load_or_create_party_sets(quiet=quiet)
-        bloom_filters_full = [self.build_bloom_filter(party_set) for party_set in party_sets]
+        bloom_filters_full = self.load_or_build_bloom_filters(party_sets, quiet=quiet)
 
         sampled_bits = min(self.num_bloom_bits, sample_bits_cap)
         scale_factor = self.num_bloom_bits / sampled_bits
@@ -914,23 +1132,201 @@ def run_scaling_experiments(
     print(f"\nAll 4 sweeps done in {time.perf_counter()-_all_start:.1f}s  --  plots saved in '{output_dir}'")
 
 
+def _prompt_numbered_choice(title: str, options: list, default_index: int = 0):
+    print(f"\n{title}")
+    for idx, option in enumerate(options, start=1):
+        print(f"{idx}) {option}")
+
+    while True:
+        choice = input(f"Choose [default {default_index + 1}]: ").strip()
+        if not choice:
+            return options[default_index]
+        if choice.isdigit() and 1 <= int(choice) <= len(options):
+            return options[int(choice) - 1]
+        print("Invalid choice. Try again.")
+
+
+def prompt_sample_parameters(defaults: dict) -> dict:
+    num_parties = _prompt_numbered_choice(
+        "Choose number of parties",
+        [2, 3, 4, 5],
+        default_index=1,
+    )
+    threshold = _prompt_numbered_choice(
+        "Choose threshold",
+        list(range(1, num_parties + 1)),
+        default_index=min(defaults["threshold"], num_parties) - 1,
+    )
+    num_common_ips = _prompt_numbered_choice(
+        "Choose number of common IPs",
+        [1, 2, 3, 5, 10],
+        default_index=2,
+    )
+    party_set_size = _prompt_numbered_choice(
+        "Choose party set size",
+        [10, 25, 50, 100, 250],
+        default_index=3,
+    )
+    false_positive_rate = _prompt_numbered_choice(
+        "Choose false positive rate",
+        [0.01, 0.005, 0.001, 0.0005],
+        default_index=3,
+    )
+
+    return {
+        "num_parties": num_parties,
+        "threshold": threshold,
+        "false_positive_rate": false_positive_rate,
+        "num_common_ips": num_common_ips,
+        "party_set_size": party_set_size,
+    }
+
+
+def run_sample_demo(config: dict) -> None:
+    tc = ThresholdCircuit(**config)
+    print(f"\nDataset tag            = {tc._dataset_tag()}")
+    print(f"Bloom filter size      M = {tc.num_bloom_bits:,} bits")
+    print(f"Number of hash funcs   K = {tc.num_hash_funcs}")
+
+    party_sets = tc.load_or_create_party_sets()
+    bloom_filters = tc.load_or_build_bloom_filters(party_sets)
+    print(f"\nBuilt {len(bloom_filters)} Bloom filters  "
+          f"({tc.num_bloom_bits} bits each, K={tc.num_hash_funcs} hash functions, "
+          f"FPR={tc.false_positive_rate*100:.2f}%)")
+
+    canonical_circuit = tc.build_canonical_circuit()
+    print(f"\nCanonical circuit: {canonical_circuit}")
+
+    optimized_circuit = tc.optimize_circuit(canonical_circuit)
+    print(f"Optimized circuit: {optimized_circuit}")
+
+    plaintext_result = tc.evaluate_plaintext_circuit(optimized_circuit, bloom_filters)
+    ones_count = sum(plaintext_result)
+    print(f"\nIntersection Bloom filter: {len(plaintext_result)} bits,  "
+          f"{ones_count} set ({100*ones_count/len(plaintext_result):.1f}% density)")
+
+    recovered_from_plain = tc.extract_candidates_from_intersection_bloom(
+        plaintext_result,
+        party_sets,
+    )
+    exact_elements = tc.exact_threshold_intersection(party_sets)
+    print(f"Recovered intersection candidates from plaintext bloom result: {recovered_from_plain}")
+    print(f"Exact threshold intersection from plaintext sets: {exact_elements}")
+
+    print("\n--- Concrete-Python Encrypted Evaluation ---")
+    try:
+        encrypted_bloom_filters = [tc.encrypt_bloom_filter(bits) for bits in bloom_filters]
+        encrypted_result = tc.evaluate_encrypted_circuit(
+            optimized_circuit,
+            encrypted_bloom_filters,
+        )
+        decrypted_result = tc.decrypt_bloom_filter(encrypted_result)
+        print(f"Decrypted result (first 30 bits): {decrypted_result[:30]}")
+        matches = decrypted_result == plaintext_result
+        print(f"Matches plaintext result: {matches}")
+        recovered_candidates = tc.extract_candidates_from_intersection_bloom(
+            decrypted_result,
+            party_sets,
+        )
+        print(f"Recovered candidates from decrypted bloom filter: {recovered_candidates}")
+    except RuntimeError as exc:
+        print(f"Concrete-python FHE unavailable on this machine: {exc}")
+
+
+def prepare_input_files(sample_config: dict) -> None:
+    print("\nPreparing cached input files for sample run and scaling experiments...")
+
+    configs = {
+        (
+            sample_config["num_parties"],
+            sample_config["threshold"],
+            sample_config["false_positive_rate"],
+            sample_config["num_common_ips"],
+            sample_config["party_set_size"],
+        )
+    }
+
+    for n in range(2, 11):
+        configs.add((n, max(1, n // 2), sample_config["false_positive_rate"], 10, 10**3))
+
+    for t in range(1, 11):
+        configs.add((10, t, sample_config["false_positive_rate"], 10, 10**3))
+
+    for set_size in [10, 100, 1000]:
+        configs.add((10, 5, sample_config["false_positive_rate"], 1, set_size))
+
+    for common_ips in [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000]:
+        configs.add((10, 5, sample_config["false_positive_rate"], common_ips, 10**3))
+
+    ordered_configs = sorted(configs)
+    for idx, config in enumerate(ordered_configs, start=1):
+        num_parties, threshold, false_positive_rate, num_common_ips, party_set_size = config
+        tc = ThresholdCircuit(
+            num_parties=num_parties,
+            threshold=threshold,
+            false_positive_rate=false_positive_rate,
+            num_common_ips=num_common_ips,
+            party_set_size=party_set_size,
+        )
+        print(f"[{idx}/{len(ordered_configs)}] Preparing {tc._dataset_tag()}...")
+        party_sets = tc.load_or_create_party_sets(quiet=True)
+        tc.load_or_build_bloom_filters(party_sets, quiet=True)
+
+    print("All requested input files and Bloom caches are ready.")
+
+
+def run_menu(sample_config: dict, scaling_config: dict) -> None:
+    while True:
+        print("\nThreshold PSI Mini Program")
+        print("1) Generate input files")
+        print("2) Run sample experiment")
+        print("3) Run scaling experiments")
+        print("4) Exit")
+
+        choice = input("Select option: ").strip()
+        if choice == "1":
+            prepare_input_files(sample_config)
+        elif choice == "2":
+            chosen_config = prompt_sample_parameters(sample_config)
+            run_sample_demo(chosen_config)
+        elif choice == "3":
+            print("\n--- Scaling Experiments ---")
+            run_scaling_experiments(
+                false_positive_rate=float(
+                    scaling_config.get("false_positive_rate", sample_config["false_positive_rate"])
+                ),
+                max_parties=int(scaling_config.get("max_parties", 10)),
+                sample_bits_cap=int(scaling_config.get("sample_bits_cap", 100_000)),
+                output_dir=str(scaling_config.get("output_dir", "benchmark_outputs")),
+            )
+        elif choice == "4":
+            print("Exiting.")
+            break
+        else:
+            print("Invalid choice. Try again.")
+
+
 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
-def load_bloom_runtime_config() -> dict:
+def load_menu_runtime_config() -> dict:
     defaults = {
-        "script_mode": "bloom",
-        "num_parties": 3,
-        "threshold": 2,
-        "false_positive_rate": 0.0005,
-        "num_common_ips": 5,
-        "party_set_size": 10**2,
-        "run_scaling_experiments": True,
-        "max_parties": 10,
-        "sample_bits_cap": 100_000,
-        "output_dir": "benchmark_outputs",
+        "script_mode": "circuit_menu",
+        "sample_config": {
+            "num_parties": 3,
+            "threshold": 2,
+            "false_positive_rate": 0.0005,
+            "num_common_ips": 5,
+            "party_set_size": 10**2,
+        },
+        "scaling_config": {
+            "false_positive_rate": 0.0005,
+            "max_parties": 10,
+            "sample_bits_cap": 100_000,
+            "output_dir": "benchmark_outputs",
+        },
     }
     os.makedirs(ThresholdCircuit.PARTY_SETS_DIR, exist_ok=True)
     config_path = os.path.join(
@@ -944,93 +1340,20 @@ def load_bloom_runtime_config() -> dict:
             existing = json.load(fh)
         if isinstance(existing, dict):
             config.update(existing)
-    else:
-        with open(config_path, "w") as fh:
-            json.dump(config, fh, indent=2)
 
-    config["script_mode"] = "bloom"
+    sample_config = defaults["sample_config"].copy()
+    sample_config.update(config.get("sample_config", {}))
+    config["sample_config"] = sample_config
+
+    scaling_config = defaults["scaling_config"].copy()
+    scaling_config.update(config.get("scaling_config", {}))
+    config["scaling_config"] = scaling_config
+
+    config["script_mode"] = "circuit_menu"
     with open(config_path, "w") as fh:
         json.dump(config, fh, indent=2)
     return config
 
 if __name__ == "__main__":
-    runtime = load_bloom_runtime_config()
-    RUN_SCALING_EXPERIMENTS = bool(runtime.get("run_scaling_experiments", True))
-
-    # ---- Parameters --------------------------------------------------------
-    NUM_PARTIES = int(runtime.get("num_parties", 3))
-    THRESHOLD = int(runtime.get("threshold", 2))
-    FALSE_POSITIVE_RATE = float(runtime.get("false_positive_rate", 0.0005))
-    NUM_COMMON_IPS = int(runtime.get("num_common_ips", 5))
-    PARTY_SET_SIZE = int(runtime.get("party_set_size", 10**2))
-
-    # ---- Setup -------------------------------------------------------------
-    tc = ThresholdCircuit(
-        num_parties=NUM_PARTIES,
-        threshold=THRESHOLD,
-        false_positive_rate=FALSE_POSITIVE_RATE,
-        num_common_ips=NUM_COMMON_IPS,
-        party_set_size=PARTY_SET_SIZE,
-    )
-    print(f"Bloom filter size      M = {tc.num_bloom_bits:,} bits")
-    print(f"Number of hash funcs   K = {tc.num_hash_funcs}")
-
-    # ---- Party sets --------------------------------------------------------
-    party_sets = tc.load_or_create_party_sets()
-
-    # ---- Bloom filters (plaintext) -----------------------------------------
-    bloom_filters = [tc.build_bloom_filter(party_set) for party_set in party_sets]
-    print(f"\nBuilt {len(bloom_filters)} Bloom filters  "
-          f"({tc.num_bloom_bits} bits each, K={tc.num_hash_funcs} hash functions, "
-          f"FPR={tc.false_positive_rate*100:.2f}%)")
-
-    # ---- Circuit -----------------------------------------------------------
-    canonical_circuit = tc.build_canonical_circuit()
-    print(f"\nCanonical circuit: {canonical_circuit}")
-
-    optimized_circuit = tc.optimize_circuit(canonical_circuit)
-    print(f"Optimized circuit: {optimized_circuit}")
-
-    # ---- Plaintext evaluation ----------------------------------------------
-    plaintext_result = tc.evaluate_plaintext_circuit(optimized_circuit, bloom_filters)
-    _ones = sum(plaintext_result)
-    print(f"\nIntersection Bloom filter: {len(plaintext_result)} bits,  "
-          f"{_ones} set ({100*_ones/len(plaintext_result):.1f}% density)")
-
-    # Recover candidate elements from the (plaintext) threshold-intersection Bloom bits.
-    recovered_from_plain = tc.extract_candidates_from_intersection_bloom(
-        plaintext_result,
-        party_sets,
-    )
-    exact_elements = tc.exact_threshold_intersection(party_sets)
-    print(f"Recovered intersection candidates from plaintext bloom result: {recovered_from_plain}")
-    print(f"Exact threshold intersection from plaintext sets: {exact_elements}")
-
-    # ---- Concrete-python encrypted evaluation (temporarily disabled) ------
-    print("\n--- Concrete-Python Encrypted Evaluation ---")
-    try:
-        encrypted_bloom_filters = [
-            tc.encrypt_bloom_filter(bf) for bf in bloom_filters
-        ]
-        encrypted_result = tc.evaluate_encrypted_circuit(
-            optimized_circuit, encrypted_bloom_filters
-        )
-        decrypted_result = tc.decrypt_bloom_filter(encrypted_result)
-        print(f"Decrypted result (first 30 bits): {decrypted_result[:30]}")
-        matches = decrypted_result == plaintext_result
-        print(f"Matches plaintext result: {matches}")
-        recovered_candidates = tc.extract_candidates_from_intersection_bloom(
-            decrypted_result, party_sets,
-        )
-        print(f"Recovered candidates from decrypted bloom filter: {recovered_candidates}")
-    except RuntimeError as exc:
-        print(f"Concrete-python FHE unavailable on this machine: {exc}")
-
-    if RUN_SCALING_EXPERIMENTS:
-        print("\n--- Scaling Experiments ---")
-        run_scaling_experiments(
-            false_positive_rate=FALSE_POSITIVE_RATE,
-            max_parties=int(runtime.get("max_parties", 10)),
-            sample_bits_cap=int(runtime.get("sample_bits_cap", 100_000)),
-            output_dir=str(runtime.get("output_dir", "benchmark_outputs")),
-        )
+    runtime = load_menu_runtime_config()
+    run_menu(runtime["sample_config"], runtime["scaling_config"])

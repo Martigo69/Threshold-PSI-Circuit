@@ -1,0 +1,12 @@
+{
+  "script_mode": "bloom",
+  "num_parties": 3,
+  "threshold": 2,
+  "false_positive_rate": 0.0005,
+  "num_common_ips": 5,
+  "party_set_size": 100,
+  "run_scaling_experiments": true,
+  "max_parties": 10,
+  "sample_bits_cap": 100000,
+  "output_dir": "benchmark_outputs"
+}
