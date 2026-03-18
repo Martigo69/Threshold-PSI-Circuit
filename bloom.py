@@ -498,8 +498,10 @@ class ThresholdCircuit:
         This path captures effects from data-generation parameters like
         num_common_ips, unlike synthetic random bit generation.
         """
+        prep_start = time.perf_counter()
         party_sets = self.load_or_create_party_sets(quiet=quiet)
         bloom_filters_full = [self.build_bloom_filter(party_set) for party_set in party_sets]
+        prep_elapsed = time.perf_counter() - prep_start
 
         sampled_bits = min(self.num_bloom_bits, sample_bits_cap)
         scale_factor = self.num_bloom_bits / sampled_bits
@@ -544,9 +546,14 @@ class ThresholdCircuit:
             "scale_factor": scale_factor,
             "encrypted_sampled_bits": encrypted_sampled_bits,
             "encrypted_scale_factor": encrypted_scale_factor,
+            "preprocessing_time_s": prep_elapsed,
             "plaintext_time_sampled_s": plain_elapsed,
+            "plaintext_time_with_preprocessing_s": prep_elapsed + plain_elapsed,
             "plaintext_time_estimated_full_s": plain_elapsed * scale_factor,
             "encrypted_time_sampled_s": encrypted_elapsed,
+            "encrypted_time_with_preprocessing_s": (
+                None if encrypted_elapsed is None else prep_elapsed + encrypted_elapsed
+            ),
             "encrypted_time_estimated_full_s": (
                 None if encrypted_elapsed is None else encrypted_elapsed * encrypted_scale_factor
             ),
@@ -771,11 +778,57 @@ def _plot_scaling_graph(
     plt.close()
 
 
+def _expand_range_spec(range_spec):
+    if isinstance(range_spec, str):
+        token = range_spec.strip().strip("[]")
+        parts = [part.strip() for part in token.split("..") if part.strip()]
+        if len(parts) == 2:
+            start, end = int(parts[0]), int(parts[1])
+            step = 1 if start <= end else -1
+            return list(range(start, end + step, step))
+        if len(parts) == 3:
+            start, end, step = int(parts[0]), int(parts[1]), int(parts[2])
+            if step == 0:
+                raise ValueError("Range step cannot be zero.")
+            return list(range(start, end + (1 if step > 0 else -1), step))
+
+    if isinstance(range_spec, (list, tuple)):
+        if len(range_spec) == 2:
+            start, end = int(range_spec[0]), int(range_spec[1])
+            step = 1 if start <= end else -1
+            return list(range(start, end + step, step))
+        if len(range_spec) == 3:
+            start, end, step = int(range_spec[0]), int(range_spec[1]), int(range_spec[2])
+            if step == 0:
+                raise ValueError("Range step cannot be zero.")
+            return list(range(start, end + (1 if step > 0 else -1), step))
+
+    raise ValueError(f"Unsupported range specification: {range_spec}")
+
+
+def _expand_sequence_spec(spec, default_values):
+    if spec is None:
+        return list(default_values)
+    if isinstance(spec, list):
+        return spec
+    if isinstance(spec, dict):
+        if "values" in spec:
+            return spec["values"]
+        if "range" in spec:
+            return _expand_range_spec(spec["range"])
+        if "start" in spec and "end" in spec:
+            return _expand_range_spec([spec["start"], spec["end"], spec.get("step", 1)])
+    if isinstance(spec, str) and ".." in spec:
+        return _expand_range_spec(spec)
+    return list(default_values)
+
+
 def run_scaling_experiments(
     false_positive_rate: float = 0.0005,
     max_parties: int = 10,
     sample_bits_cap: int = 100_000,
     output_dir: str = "benchmark_outputs",
+    scaling_sweeps: dict = None,
 ):
     """
     Run scaling sweeps and save plots:
@@ -784,32 +837,78 @@ def run_scaling_experiments(
     3) party set size sweep (10..10^7)
     4) common IPs sweep (fixed N, T, set size)
     """
+    default_sweeps = {
+        "parties": {
+            "n_values": {"range": [2, max_parties]},
+            "threshold_mode": "half",
+            "party_set_size": 10**3,
+            "num_common_ips": 10,
+        },
+        "threshold": {
+            "n_fixed": max_parties,
+            "t_values": {"range": [1, max_parties]},
+            "party_set_size": 10**3,
+            "num_common_ips": 10,
+        },
+        "set_size": {
+            "set_sizes": [10, 100, 1000],
+            "num_parties": 10,
+            "threshold": 5,
+            "num_common_ips": 1,
+        },
+        "common_ips": {
+            "common_values": [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000],
+            "num_parties": 10,
+            "threshold": 5,
+            "party_set_size": 10**3,
+        },
+    }
+    if isinstance(scaling_sweeps, dict):
+        for section, section_values in scaling_sweeps.items():
+            if section in default_sweeps and isinstance(section_values, dict):
+                default_sweeps[section].update(section_values)
+
     os.makedirs(output_dir, exist_ok=True)
     _all_start = time.perf_counter()
 
     # ------------------------------------------------------------------
-    # 1) Parties sweep  N=2..max_parties  T~N/2  (synthetic Bloom bits)
+    # 1) Parties sweep
     # ------------------------------------------------------------------
     _t0 = time.perf_counter()
     parties_x, parties_plain, parties_enc = [], [], []
-    fixed_set_size_for_parties = 10**3
-    _w = len(str(max_parties))
-    print(f"[1/4] Parties sweep  N=2..{max_parties}  T~N/2  (real IP files -- disk I/O per step)")
-    for n in range(2, max_parties + 1):
-        print(f"      N={n:{_w}}/{max_parties}  generating {n} party files...", end='\r', flush=True)
-        t = max(1, n // 2)
+    parties_cfg = default_sweeps["parties"]
+    parties_n_values = [int(v) for v in _expand_sequence_spec(parties_cfg.get("n_values"), list(range(2, max_parties + 1)))]
+    fixed_set_size_for_parties = int(parties_cfg.get("party_set_size", 10**3))
+    parties_common_ips = int(parties_cfg.get("num_common_ips", 10))
+    threshold_mode = str(parties_cfg.get("threshold_mode", "half"))
+    _w = len(str(max(parties_n_values) if parties_n_values else max_parties))
+    print(f"[1/4] Parties sweep  N values: {parties_n_values}  (real IP files -- disk I/O per step)")
+    for idx, n in enumerate(parties_n_values, 1):
+        if threshold_mode == "half":
+            t = max(1, n // 2)
+        else:
+            t = int(parties_cfg.get("threshold", max(1, n // 2)))
+            t = max(1, min(t, n))
         tc = ThresholdCircuit(
             num_parties=n,
             threshold=t,
             false_positive_rate=false_positive_rate,
-            num_common_ips=10,
+            num_common_ips=parties_common_ips,
             party_set_size=fixed_set_size_for_parties,
         )
+        # Print detailed parameters and calculated values
+        print(f"\n      [{idx}/{len(parties_n_values)}] Experiment: N={n}, T={t}")
+        print(f"        Parameters: party_set_size={fixed_set_size_for_parties}, num_common_ips={parties_common_ips}, FPR={false_positive_rate}")
+        print(f"        Calculated: M={tc.num_bloom_bits:,} bits, K={tc.num_hash_funcs} hash functions")
+        print(f"        Running benchmark...", end='', flush=True)
+        _exp_start = time.perf_counter()
         metrics = tc.benchmark_computation_times_from_party_sets(sample_bits_cap=sample_bits_cap, include_encrypted=True, quiet=True)
+        _exp_time = time.perf_counter() - _exp_start
         parties_x.append(n)
         parties_plain.append(metrics["plaintext_time_estimated_full_s"])
         parties_enc.append(metrics["encrypted_time_estimated_full_s"])
-    print(f"[1/4] Parties sweep  done  ({time.perf_counter()-_t0:.1f}s)                    ")
+        print(f" done ({_exp_time:.2f}s)  |  plaintext: {metrics['plaintext_time_estimated_full_s']:.3f}s, encrypted: {metrics['encrypted_time_estimated_full_s']:.3f}s")
+    print(f"\n[1/4] Parties sweep  done  ({time.perf_counter()-_t0:.1f}s)")
     _plot_scaling_graph(
         parties_x, parties_plain, parties_enc,
         title="Computation Time vs Number of Parties",
@@ -818,28 +917,39 @@ def run_scaling_experiments(
     )
 
     # ------------------------------------------------------------------
-    # 2) Threshold sweep  T=1..N  fixed N=max_parties  (synthetic Bloom bits)
+    # 2) Threshold sweep
     # ------------------------------------------------------------------
     _t0 = time.perf_counter()
     threshold_x, threshold_plain, threshold_enc = [], [], []
-    fixed_set_size_for_threshold = 10**3
-    n_fixed = max_parties
+    threshold_cfg = default_sweeps["threshold"]
+    fixed_set_size_for_threshold = int(threshold_cfg.get("party_set_size", 10**3))
+    n_fixed = int(threshold_cfg.get("n_fixed", max_parties))
+    threshold_common_ips = int(threshold_cfg.get("num_common_ips", 10))
+    t_values = [int(v) for v in _expand_sequence_spec(threshold_cfg.get("t_values"), list(range(1, n_fixed + 1)))]
+    t_values = [t for t in t_values if 1 <= t <= n_fixed]
     _w = len(str(n_fixed))
-    print(f"[2/4] Threshold sweep  T=1..{n_fixed}  N={n_fixed}  (real IP files -- disk I/O per step)")
-    for t in range(1, n_fixed + 1):
-        print(f"      T={t:{_w}}/{n_fixed}  generating {n_fixed} party files...", end='\r', flush=True)
+    print(f"[2/4] Threshold sweep  T values: {t_values}  N={n_fixed}  (real IP files -- disk I/O per step)")
+    for idx, t in enumerate(t_values, 1):
         tc = ThresholdCircuit(
             num_parties=n_fixed,
             threshold=t,
             false_positive_rate=false_positive_rate,
-            num_common_ips=10,
+            num_common_ips=threshold_common_ips,
             party_set_size=fixed_set_size_for_threshold,
         )
+        # Print detailed parameters and calculated values
+        print(f"\n      [{idx}/{len(t_values)}] Experiment: N={n_fixed}, T={t}")
+        print(f"        Parameters: party_set_size={fixed_set_size_for_threshold}, num_common_ips={threshold_common_ips}, FPR={false_positive_rate}")
+        print(f"        Calculated: M={tc.num_bloom_bits:,} bits, K={tc.num_hash_funcs} hash functions")
+        print(f"        Running benchmark...", end='', flush=True)
+        _exp_start = time.perf_counter()
         metrics = tc.benchmark_computation_times_from_party_sets(sample_bits_cap=sample_bits_cap, include_encrypted=True, quiet=True)
+        _exp_time = time.perf_counter() - _exp_start
         threshold_x.append(t)
         threshold_plain.append(metrics["plaintext_time_estimated_full_s"])
         threshold_enc.append(metrics["encrypted_time_estimated_full_s"])
-    print(f"[2/4] Threshold sweep  done  ({time.perf_counter()-_t0:.1f}s)                    ")
+        print(f" done ({_exp_time:.2f}s)  |  plaintext: {metrics['plaintext_time_estimated_full_s']:.3f}s, encrypted: {metrics['encrypted_time_estimated_full_s']:.3f}s")
+    print(f"\n[2/4] Threshold sweep  done  ({time.perf_counter()-_t0:.1f}s)")
     _plot_scaling_graph(
         threshold_x, threshold_plain, threshold_enc,
         title=f"Computation Time vs Threshold (N={n_fixed})",
@@ -848,26 +958,36 @@ def run_scaling_experiments(
     )
 
     # ------------------------------------------------------------------
-    # 3) Set-size sweep  10..10^7  (synthetic Bloom bits)
+    # 3) Set-size sweep
     # ------------------------------------------------------------------
     _t0 = time.perf_counter()
-    size_x = [10**i for i in range(1, 4)]  # 10 to 1,000
+    size_cfg = default_sweeps["set_size"]
+    size_x = [int(v) for v in _expand_sequence_spec(size_cfg.get("set_sizes"), [10, 100, 1000])]
     size_plain, size_enc = [], []
-    n_for_size, t_for_size = 10, 5
-    print(f"[3/4] Set-size sweep  10..10^3  N={n_for_size}  T={t_for_size}  (real IP files -- disk I/O per step)")
+    n_for_size = int(size_cfg.get("num_parties", 10))
+    t_for_size = int(size_cfg.get("threshold", 5))
+    c_for_size = int(size_cfg.get("num_common_ips", 1))
+    print(f"[3/4] Set-size sweep  values: {size_x}  N={n_for_size}  T={t_for_size}  (real IP files -- disk I/O per step)")
     for i, set_size in enumerate(size_x, 1):
-        print(f"      [{i}/{len(size_x)}] set_size={set_size:,}  generating {n_for_size} party files...", end='\r', flush=True)
         tc = ThresholdCircuit(
             num_parties=n_for_size,
             threshold=t_for_size,
             false_positive_rate=false_positive_rate,
-            num_common_ips=1,
+            num_common_ips=c_for_size,
             party_set_size=set_size,
         )
+        # Print detailed parameters and calculated values
+        print(f"\n      [{i}/{len(size_x)}] Experiment: N={n_for_size}, T={t_for_size}, party_set_size={set_size:,}")
+        print(f"        Parameters: num_common_ips={c_for_size}, FPR={false_positive_rate}")
+        print(f"        Calculated: M={tc.num_bloom_bits:,} bits, K={tc.num_hash_funcs} hash functions")
+        print(f"        Running benchmark...", end='', flush=True)
+        _exp_start = time.perf_counter()
         metrics = tc.benchmark_computation_times_from_party_sets(sample_bits_cap=sample_bits_cap, include_encrypted=True, quiet=True)
+        _exp_time = time.perf_counter() - _exp_start
         size_plain.append(metrics["plaintext_time_estimated_full_s"])
         size_enc.append(metrics["encrypted_time_estimated_full_s"])
-    print(f"[3/4] Set-size sweep  done  ({time.perf_counter()-_t0:.1f}s)                    ")
+        print(f" done ({_exp_time:.2f}s)  |  plaintext: {metrics['plaintext_time_estimated_full_s']:.3f}s, encrypted: {metrics['encrypted_time_estimated_full_s']:.3f}s")
+    print(f"\n[3/4] Set-size sweep  done  ({time.perf_counter()-_t0:.1f}s)")
     _plot_scaling_graph(
         size_x, size_plain, size_enc,
         title=f"Computation Time vs Party Set Size (N={n_for_size}, T={t_for_size})",
@@ -876,16 +996,18 @@ def run_scaling_experiments(
     )
 
     # ------------------------------------------------------------------
-    # 4) Common-IPs sweep  (REAL party sets -- regenerated each iteration)
+    # 4) Common-IPs sweep
     # ------------------------------------------------------------------
     _t0 = time.perf_counter()
-    common_x = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000]
+    common_cfg = default_sweeps["common_ips"]
+    common_x = [int(v) for v in _expand_sequence_spec(common_cfg.get("common_values"), [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000])]
     common_plain, common_enc = [], []
-    n_for_common, t_for_common, set_size_for_common = 10, 5, 10**3
+    n_for_common = int(common_cfg.get("num_parties", 10))
+    t_for_common = int(common_cfg.get("threshold", 5))
+    set_size_for_common = int(common_cfg.get("party_set_size", 10**3))
     print(f"[4/4] Common-IPs sweep  N={n_for_common}  T={t_for_common}  set_size={set_size_for_common:,}")
     print( "      (party files are written to disk and regenerated whenever params change)")
     for i, common_ips in enumerate(common_x, 1):
-        print(f"      [{i}/{len(common_x)}] common_ips={common_ips:<4}  generating {n_for_common} party files...", end='\r', flush=True)
         tc = ThresholdCircuit(
             num_parties=n_for_common,
             threshold=t_for_common,
@@ -893,14 +1015,22 @@ def run_scaling_experiments(
             num_common_ips=common_ips,
             party_set_size=set_size_for_common,
         )
+        # Print detailed parameters and calculated values
+        print(f"\n      [{i}/{len(common_x)}] Experiment: N={n_for_common}, T={t_for_common}, num_common_ips={common_ips}")
+        print(f"        Parameters: party_set_size={set_size_for_common:,}, FPR={false_positive_rate}")
+        print(f"        Calculated: M={tc.num_bloom_bits:,} bits, K={tc.num_hash_funcs} hash functions")
+        print(f"        Running benchmark...", end='', flush=True)
+        _exp_start = time.perf_counter()
         metrics = tc.benchmark_computation_times_from_party_sets(
             sample_bits_cap=sample_bits_cap,
             include_encrypted=True,
             quiet=True,
         )
+        _exp_time = time.perf_counter() - _exp_start
         common_plain.append(metrics["plaintext_time_estimated_full_s"])
         common_enc.append(metrics["encrypted_time_estimated_full_s"])
-    print(f"[4/4] Common-IPs sweep  done  ({time.perf_counter()-_t0:.1f}s)                    ")
+        print(f" done ({_exp_time:.2f}s)  |  plaintext: {metrics['plaintext_time_estimated_full_s']:.3f}s, encrypted: {metrics['encrypted_time_estimated_full_s']:.3f}s")
+    print(f"\n[4/4] Common-IPs sweep  done  ({time.perf_counter()-_t0:.1f}s)")
     _plot_scaling_graph(
         common_x, common_plain, common_enc,
         title=(
@@ -931,6 +1061,32 @@ def load_bloom_runtime_config() -> dict:
         "max_parties": 10,
         "sample_bits_cap": 100_000,
         "output_dir": "benchmark_outputs",
+        "scaling_sweeps": {
+            "parties": {
+                "n_values": {"range": [2, 10]},
+                "threshold_mode": "half",
+                "party_set_size": 1000,
+                "num_common_ips": 10
+            },
+            "threshold": {
+                "n_fixed": 10,
+                "t_values": {"range": "1..10"},
+                "party_set_size": 1000,
+                "num_common_ips": 10
+            },
+            "set_size": {
+                "set_sizes": [10, 100, 1000],
+                "num_parties": 10,
+                "threshold": 5,
+                "num_common_ips": 1
+            },
+            "common_ips": {
+                "common_values": [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000],
+                "num_parties": 10,
+                "threshold": 5,
+                "party_set_size": 1000
+            }
+        },
     }
     os.makedirs(ThresholdCircuit.PARTY_SETS_DIR, exist_ok=True)
     config_path = os.path.join(
@@ -1033,4 +1189,5 @@ if __name__ == "__main__":
             max_parties=int(runtime.get("max_parties", 10)),
             sample_bits_cap=int(runtime.get("sample_bits_cap", 100_000)),
             output_dir=str(runtime.get("output_dir", "benchmark_outputs")),
+            scaling_sweeps=runtime.get("scaling_sweeps"),
         )

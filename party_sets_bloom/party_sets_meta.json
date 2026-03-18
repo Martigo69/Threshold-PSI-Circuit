@@ -6,7 +6,37 @@
   "num_common_ips": 5,
   "party_set_size": 100,
   "run_scaling_experiments": true,
-  "max_parties": 10,
+  "max_parties": 20,
   "sample_bits_cap": 100000,
-  "output_dir": "benchmark_outputs"
+  "output_dir": "benchmark_outputs",
+  "scaling_sweeps": {
+    "parties": {
+      "n_values": {
+        "range": [2, 20]
+      },
+      "threshold_mode": "half",
+      "party_set_size": 1000000,
+      "num_common_ips": 10
+    },
+    "threshold": {
+      "n_fixed": 20,
+      "t_values": {
+        "range": "1..20"
+      },
+      "party_set_size": 1000000,
+      "num_common_ips": 10
+    },
+    "set_size": {
+      "set_sizes": [10, 100, 1000, 10000, 100000, 1000000],
+      "num_parties": 20,
+      "threshold": 10,
+      "num_common_ips": 1
+    },
+    "common_ips": {
+      "common_values": [10, 100, 1000, 10000, 100000, 1000000],
+      "num_parties": 20,
+      "threshold": 10,
+      "party_set_size": 1000000
+    }
+  }
 }
