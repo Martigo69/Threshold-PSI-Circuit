@@ -1,4 +1,5 @@
 __pycache__/
 *.py[cod]
-party_sets/
+party_sets/*
+!party_sets/party_sets_meta.json
 *.Zone.Identifier
