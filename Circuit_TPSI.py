@@ -1,4 +1,4 @@
-"""
+﻿"""
 Consolidated Threshold PSI Circuit - Unified Implementation
 Merge of bloom.py and Circuit_menu.py with menu enable/disable option
 """
@@ -9,12 +9,10 @@ import os
 import json
 import array
 import time
-import threading
-import sys
-import shutil
 import re
 import gc
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import sys
+from datetime import datetime
 
 import numpy as np
 from probables import BloomFilter
@@ -22,96 +20,82 @@ from concrete import fhe
 import matplotlib.pyplot as plt
 
 # ============================================================================
-# CONFIGURATION - Set to True to enable interactive menu, False for script mode
+# CONFIGURATION - To enable and disable the interactive menu
 # ============================================================================
-USE_MENU = True  # Set to False to run in standalone script mode
+USE_MENU = True 
 
 
 # ============================================================================
-# Utility Classes for Progress Display
+# Realtime logging helpers (append mode, line-buffered)
 # ============================================================================
 
-class _LiveSpinner:
-    """Render a single-line spinner for long blocking steps."""
-
-    def __init__(self, label: str, interval: float = 0.2):
-        self.label = label
-        self.interval = interval
-        self._start = 0.0
-        self._stop_event = threading.Event()
-        self._thread = None
-        self._last_line_len = 0
-
-    def _write_line(self, text: str) -> None:
-        padded = text.ljust(self._last_line_len)
-        self._last_line_len = len(padded)
-        sys.stdout.write("\r" + padded)
-        sys.stdout.flush()
-
-    def _run(self) -> None:
-        frames = "|/-\\"
-        idx = 0
-        while not self._stop_event.wait(self.interval):
-            elapsed = time.perf_counter() - self._start
-            self._write_line(f"[FHE] {self.label} {frames[idx % len(frames)]}  elapsed {elapsed:6.1f}s")
-            idx += 1
-
-    def __enter__(self):
-        self._start = time.perf_counter()
-        self._write_line(f"[FHE] {self.label} ")
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        self._stop_event.set()
-        if self._thread is not None:
-            self._thread.join()
-        elapsed = time.perf_counter() - self._start
-        status = "done" if exc is None else "failed"
-        self._write_line(f"[FHE] {self.label} {status}  elapsed {elapsed:6.1f}s")
-        sys.stdout.write("\n")
-        sys.stdout.flush()
+_LOG_STREAM = None
 
 
-class _LiveProgress:
-    """Render throttled single-line progress for iterative encrypted steps."""
+def setup_realtime_logging(log_file_path: str = "party_sets/party_sets_runtime.log") -> str:
+    """Route all stdout/stderr to a persistent log file in realtime (no console output)."""
+    global _LOG_STREAM
 
-    def __init__(self, label: str, total: int, interval: float = 0.2):
-        self.label = label
-        self.total = max(total, 1)
-        self.interval = interval
-        self._start = time.perf_counter()
-        self._last_render = 0.0
-        self._last_line_len = 0
+    log_dir = os.path.dirname(log_file_path)
+    if log_dir:
+        os.makedirs(log_dir, exist_ok=True)
 
-    def _write_line(self, text: str) -> None:
-        padded = text.ljust(self._last_line_len)
-        self._last_line_len = len(padded)
-        sys.stdout.write("\r" + padded)
-        sys.stdout.flush()
+    _LOG_STREAM = open(log_file_path, "w", buffering=1, encoding="utf-8")
+    sys.stdout = _LOG_STREAM
+    sys.stderr = _LOG_STREAM
+    print("\n" + "=" * 80)
+    print(f"Session started at {datetime.now().isoformat(sep=' ', timespec='seconds')}")
+    print(f"Realtime log file: {log_file_path}")
+    print("=" * 80)
+    return log_file_path
 
-    def update(self, current: int, detail: str = "", force: bool = False) -> None:
-        now = time.perf_counter()
-        if not force and current < self.total and (now - self._last_render) < self.interval:
-            return
 
-        elapsed = now - self._start
-        progress = current / self.total
-        rate = current / elapsed if elapsed > 0 else 0.0
-        eta = (self.total - current) / rate if rate > 0 else float("inf")
-        eta_text = f"{eta:6.1f}s" if eta != float("inf") else "   n/a"
-        detail_text = f"  {detail}" if detail else ""
-        self._write_line(
-            f"[FHE] {self.label} {current}/{self.total} ({progress * 100:5.1f}%)"
-            f"  elapsed {elapsed:6.1f}s  eta {eta_text}{detail_text}"
-        )
-        self._last_render = now
+def _format_seconds(value) -> str:
+    if value is None:
+        return "N/A"
+    return f"{float(value):.4f}s"
 
-    def finish(self, detail: str = "done") -> None:
-        self.update(self.total, detail=detail, force=True)
-        sys.stdout.write("\n")
-        sys.stdout.flush()
+
+def _render_timing_table(title: str, rows: list) -> None:
+    """Render an ASCII timing table for one or many runs."""
+    if not rows:
+        print(f"\n{title}: no rows")
+        return
+
+    headers = [
+        "Run",
+        "Dataset Source",
+        "Preprocessing",
+        "Circuit Creation + Optimization",
+        "Plaintext Computation",
+        "Encrypted Computation + Decryption",
+    ]
+
+    prepared_rows = []
+    for row in rows:
+        prepared_rows.append([
+            str(row.get("run", "-")),
+            str(row.get("dataset_source", "-")),
+            _format_seconds(row.get("preprocessing_total_time_s")),
+            _format_seconds(row.get("circuit_creation_time_s")),
+            _format_seconds(row.get("plaintext_computation_time_s")),
+            _format_seconds(row.get("encrypted_computation_and_decryption_time_s")),
+        ])
+
+    widths = [len(h) for h in headers]
+    for r in prepared_rows:
+        widths = [max(widths[i], len(r[i])) for i in range(len(headers))]
+
+    def _line(char="-"):
+        return "+" + "+".join(char * (w + 2) for w in widths) + "+"
+
+    print(f"\n{title}")
+    print(_line("="))
+    print("| " + " | ".join(headers[i].ljust(widths[i]) for i in range(len(headers))) + " |")
+    print(_line("-"))
+    for r in prepared_rows:
+        print("| " + " | ".join(r[i].ljust(widths[i]) for i in range(len(headers))) + " |")
+    print(_line("="))
 
 
 # ============================================================================
@@ -140,7 +124,6 @@ class ThresholdCircuit:
 
     PARTY_SETS_DIR = "party_sets"
     PARTY_SETS_META_FILE = "party_sets_meta.json"
-    MAX_PARTY_IO_WORKERS = max(1, min(32, os.cpu_count() or 1))
 
     def __init__(
         self,
@@ -154,21 +137,10 @@ class ThresholdCircuit:
         self.threshold = threshold
         self.num_common_ips = num_common_ips
         self.party_set_size = party_set_size
-        if self.num_parties <= 0:
-            raise ValueError("num_parties must be >= 1")
-        if self.party_set_size <= 0:
-            raise ValueError("party_set_size must be >= 1")
 
-        # Enforce a deterministic FPR based on dataset size.
         self.requested_false_positive_rate = 1.0 / self.party_set_size
         computed_fpr = self.requested_false_positive_rate
-        if computed_fpr <= 0.0:
-            computed_fpr = np.nextafter(0.0, 1.0)
-        elif computed_fpr >= 1.0:
-            computed_fpr = np.nextafter(1.0, 0.0)
-
-        # Derive optimal Bloom-filter parameters via pyprobables.
-        # Some probables versions reject ultra-small FPRs; relax minimally until valid.
+       
         _template = None
         for _ in range(400):
             try:
@@ -177,19 +149,15 @@ class ThresholdCircuit:
                     false_positive_rate=computed_fpr,
                 )
                 break
-            except ValueError as exc:
-                if "math domain error" not in str(exc):
-                    raise
-                computed_fpr *= 10.0
-                if computed_fpr >= 1.0:
-                    raise ValueError(
-                        "Unable to derive valid Bloom parameters for this dataset scale. "
-                        "Try reducing party_set_size or num_parties."
-                    ) from exc
+            except Exception as exc:
+                print(f"  [WARN] BloomFilter init failed with FPR={computed_fpr:.6f}: {exc}")
+                print(f"  [Update] Doubling FPR: {computed_fpr:.6f} -> {computed_fpr * 2.0:.6f}")
+                computed_fpr *= 2.0
+        
 
         self.false_positive_rate = computed_fpr
-        self.num_bloom_bits = _template.number_bits   # M
-        self.num_hash_funcs = _template.number_hashes # K
+        self.num_bloom_bits = _template.number_bits   
+        self.num_hash_funcs = _template.number_hashes 
         self._bits_per_chunk = int(_template._bits_per_elm)
         self._bloom_typecode = _template.bloom.typecode
         self._ip_space = 254 ** 4
@@ -228,7 +196,6 @@ class ThresholdCircuit:
 
     def _random_unique_ip(self, used_ips: set) -> str:
         """Return a unique IPv4 address that does not appear in used_ips."""
-        # Sequential probing avoids expensive per-IP random generation in large datasets.
         for _ in range(self._ip_space):
             ip = self._counter_to_ip(self._ip_cursor)
             self._ip_cursor = (self._ip_cursor + 1) % self._ip_space
@@ -245,7 +212,6 @@ class ThresholdCircuit:
         for idx, party_set in enumerate(party_sets):
             file_path = os.path.join(dataset_dir, f"party_{idx + 1}.txt")
             with open(file_path, "w") as fh:
-                # Build one payload and write once to avoid per-line I/O overhead.
                 fh.write("\n".join(party_set) + "\n")
 
     def _party_set_metadata_path(self) -> str:
@@ -282,41 +248,9 @@ class ThresholdCircuit:
                 files.append(os.path.join(dataset_dir, name))
         return sorted(files)
 
-    def _party_set_file_paths_from_dir(self, dataset_dir: str, num_parties: int) -> list:
-        """Get party file paths from a specific dataset directory."""
-        if not os.path.exists(dataset_dir):
-            return []
-        files = []
-        for i in range(num_parties):
-            file_path = os.path.join(dataset_dir, f"party_{i + 1}.txt")
-            if os.path.exists(file_path):
-                files.append(file_path)
-        return files
-
     def _count_non_empty_lines(self, file_path: str) -> int:
         with open(file_path, "r") as fh:
             return sum(1 for line in fh if line.strip())
-
-    def _read_metadata_from_dir(self, dataset_dir: str):
-        meta_path = os.path.join(dataset_dir, self.PARTY_SETS_META_FILE)
-        if not os.path.exists(meta_path):
-            return None
-        with open(meta_path, "r") as fh:
-            return json.load(fh)
-
-    def _read_party_sets_from_dir(self, dataset_dir: str, num_parties: int):
-        expected_files = [
-            os.path.join(dataset_dir, f"party_{i + 1}.txt")
-            for i in range(num_parties)
-        ]
-        if not all(os.path.exists(path) for path in expected_files):
-            return None
-
-        party_sets = []
-        for file_path in expected_files:
-            with open(file_path, "r") as fh:
-                party_sets.append([line.strip() for line in fh if line.strip()])
-        return party_sets
 
     def _item_counts(self, party_sets: list) -> dict:
         counts = {}
@@ -325,271 +259,11 @@ class ThresholdCircuit:
                 counts[item] = counts.get(item, 0) + 1
         return counts
 
-    def _validate_party_sets_shape(self, party_sets: list) -> bool:
-        if len(party_sets) != self.num_parties:
-            return False
-        if any(len(party) != self.party_set_size for party in party_sets):
-            return False
-
-        counts = self._item_counts(party_sets)
-        if self.threshold == 1:
-            return all(count == 1 for count in counts.values())
-
-        shared_count = sum(1 for count in counts.values() if count == self.threshold)
-        allowed_counts = all(count in (1, self.threshold) for count in counts.values())
-        return shared_count == self.num_common_ips and allowed_counts
-
-    def _score_adaptation_cost(self, source_meta: dict) -> int:
-        """Estimate adaptation work from a cached source (lower is better)."""
-        source_parties = int(source_meta.get("num_parties", 0))
-        source_set_size = int(source_meta.get("party_set_size", 0))
-        source_common = int(source_meta.get("num_common_ips", 0))
-        source_threshold = int(source_meta.get("threshold", 0))
-        target_parties = self.num_parties
-        target_set_size = self.party_set_size
-        target_common = self.num_common_ips
-        target_threshold = self.threshold
-
-        if source_parties <= 0 or source_set_size <= 0 or source_threshold <= 0 or target_threshold <= 0:
-            return 10**18
-        if source_parties < target_parties:
-            return 10**18
-        if source_set_size < target_set_size:
-            return 10**18
-        if source_common < target_common:
-            return 10**18
-        if source_threshold < target_threshold:
-            return 10**18
-
-        # Weighted cost: prefer nearest compatible source in all dimensions.
-        n_delta = source_parties - target_parties
-        t_delta = source_threshold - target_threshold
-        c_delta = source_common - target_common
-        s_delta = source_set_size - target_set_size
-        return (n_delta * 1_000_000) + (t_delta * 100_000) + (c_delta * 100) + (s_delta // 1_000)
-
-    def _find_adaptation_source(self):
-        """
-        Find best adaptation source by scoring all cached datasets.
-        Returns (source_dir, metadata, total_cost).
-        """
-        if not os.path.exists(self.PARTY_SETS_DIR):
-            return None
-
-        dataset_dirs = []
-        for name in os.listdir(self.PARTY_SETS_DIR):
-            dataset_dir = os.path.join(self.PARTY_SETS_DIR, name)
-            if os.path.isdir(dataset_dir):
-                dataset_dirs.append(dataset_dir)
-
-        if not dataset_dirs:
-            return None
-
-        def _score_candidate(dataset_dir: str):
-            metadata = self._read_metadata_from_dir(dataset_dir)
-            if metadata is None:
-                return None
-            cost = self._score_adaptation_cost(metadata)
-            if cost >= 10**18:
-                return None
-            return cost, dataset_dir, metadata
-
-        candidates = []
-        max_workers = min(len(dataset_dirs), self.MAX_PARTY_IO_WORKERS)
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            for item in pool.map(_score_candidate, dataset_dirs):
-                if item is not None:
-                    candidates.append(item)
-
-        if not candidates:
-            return None
-
-        candidates.sort(key=lambda item: item[0])
-        cost, dataset_dir, metadata = candidates[0]
-        return dataset_dir, metadata, cost
-
-    def _adapt_from_source(self, source_sets: list, source_meta: dict) -> list:
-        """
-        Adapt from cached source by down-scaling dimensions (N, T, C, S):
-        - source N/T/C/S must be >= target N/T/C/S
-        - common IPs end at exact target threshold count
-        - all non-common IPs remain unique (count 1)
-        
-        OPTIMIZATION: Counts computed once and updated incrementally (not 3+ recounts).
-        Unique-only IPs pre-cached to avoid linear searches. Batch IP generation.
-        """
-        source_num_parties = int(source_meta.get("num_parties", 0))
-        source_set_size = int(source_meta.get("party_set_size", 0))
-        source_common = int(source_meta.get("num_common_ips", 0))
-        source_threshold = int(source_meta.get("threshold", 0))
-
-        if (
-            source_num_parties < self.num_parties
-            or source_set_size < self.party_set_size
-            or source_common < self.num_common_ips
-            or source_threshold < self.threshold
-        ):
-            raise RuntimeError("Source is not a valid down-adaptation superset.")
-
-        adapted = [set(party) for party in source_sets]
-
-        # Identify source common pool (items currently shared by source threshold owners).
-        # COMPUTE ONCE and maintain incrementally instead of recounting 3+ times.
-        counts = self._item_counts(source_sets)
-        source_shared = [ip for ip, cnt in counts.items() if cnt == source_threshold]
-        if len(source_shared) < source_common:
-            raise RuntimeError("Source shared-IP structure inconsistent with metadata.")
-        source_shared = source_shared[:source_common]
-
-        # Keep exactly target C common IPs from source shared pool.
-        target_shared = source_shared[: self.num_common_ips]
-        target_shared_set = set(target_shared)
-
-        # Reduce number of parties first by dropping least/most shared owners as needed.
-        while len(adapted) > self.num_parties:
-            shared_hits = [sum(1 for ip in target_shared if ip in party) for party in adapted]
-            if source_threshold > self.threshold:
-                drop_idx = max(range(len(adapted)), key=lambda idx: shared_hits[idx])
-            else:
-                drop_idx = min(range(len(adapted)), key=lambda idx: shared_hits[idx])
-            del adapted[drop_idx]
-
-        used_ips = {ip for party in adapted for ip in party}
-
-        # Demote source-shared IPs not needed in target common set to unique (count 1).
-        for ip in source_shared:
-            if ip in target_shared_set:
-                continue
-            owners = [idx for idx, party in enumerate(adapted) if ip in party]
-            while len(owners) > 1:
-                owner = owners.pop()
-                adapted[owner].remove(ip)
-                counts[ip] -= 1
-            counts[ip] = 1 if owners else 0
-
-        # Pre-cache unique-only IPs to avoid linear search in normalize loop.
-        unique_only_ips = {ip for ip, cnt in counts.items() if cnt == 1 and ip not in target_shared_set}
-
-        # Force each target common IP to appear exactly T times.
-        for ip in target_shared:
-            owners = [idx for idx, party in enumerate(adapted) if ip in party]
-            if len(owners) > self.threshold:
-                remove_n = len(owners) - self.threshold
-                for owner in random.sample(owners, remove_n):
-                    adapted[owner].remove(ip)
-                    counts[ip] -= 1
-            elif len(owners) < self.threshold:
-                non_owners = [idx for idx in range(self.num_parties) if ip not in adapted[idx]]
-                add_n = self.threshold - len(owners)
-                if add_n > len(non_owners):
-                    raise RuntimeError("Not enough non-owner parties for threshold repair.")
-                for owner in random.sample(non_owners, add_n):
-                    adapted[owner].add(ip)
-                    counts[ip] += 1
-
-        # Normalize party sizes to target S using pre-cached unique_only_ips.
-        for party in adapted:
-            while len(party) > self.party_set_size:
-                # Intersect party with unique-only IPs for O(min size) lookup
-                removables = party & unique_only_ips
-                if not removables:
-                    raise RuntimeError("Unable to shrink party size without breaking common structure.")
-                removable = next(iter(removables))
-                party.remove(removable)
-                counts[removable] = 0
-                unique_only_ips.discard(removable)
-                used_ips.discard(removable)
-
-            if len(party) < self.party_set_size:
-                needed = self.party_set_size - len(party)
-                for _ in range(needed):
-                    new_ip = self._random_unique_ip(used_ips)
-                    party.add(new_ip)
-                    counts[new_ip] = 1
-                    unique_only_ips.add(new_ip)
-
-        adapted_lists = [list(party) for party in adapted]
-        
-        # Lightweight validation using counts dict (already computed) instead of recounting 20M IPs.
-        # Check: All parties exist and have target size
-        if len(adapted_lists) != self.num_parties:
-            raise RuntimeError(f"Adaptation produced {len(adapted_lists)} parties, expected {self.num_parties}")
-        if any(len(party) != self.party_set_size for party in adapted_lists):
-            raise RuntimeError("Adaptation produced incorrect party sizes")
-        
-        # Check: Common IPs appear exactly T times, all others appear 1 time
-        common_ips_found = [ip for ip, cnt in counts.items() if cnt == self.threshold]
-        other_ips = [ip for ip, cnt in counts.items() if cnt not in (1, self.threshold, 0)]
-        if len(common_ips_found) != self.num_common_ips:
-            raise RuntimeError(f"Adaptation produced {len(common_ips_found)} common IPs, expected {self.num_common_ips}")
-        if other_ips:
-            raise RuntimeError(f"Adaptation has IPs with invalid counts: {len(other_ips)}")
-        
-        return adapted_lists
-
-    def _verify_and_report_dataset_integrity(self) -> bool:
-        """
-        Verify dataset structure matches parameters. Returns True if valid, False if corrupted.
-        Reports validation status clearly.
-        """
-        dataset_dir = self._dataset_dir()
-        dataset_name = self._dataset_tag()
-        
-        # Check files exist
-        expected_files = {
-            os.path.join(dataset_dir, f"party_{i + 1}.txt")
-            for i in range(self.num_parties)
-        }
-        actual_files = set(self._party_set_file_paths())
-        if actual_files != expected_files:
-            print(f"  [WARN] Integrity check FAILED: Expected {self.num_parties} files, found {len(actual_files)}")
-            return False
-
-        # Read all party sets
-        try:
-            party_sets = []
-            ordered_files = sorted(actual_files)
-            for file_path in ordered_files:
-                with open(file_path, "r") as fh:
-                    ips = [line.strip() for line in fh if line.strip()]
-                party_sets.append(ips)
-            
-            # Validate sizes
-            for i, party in enumerate(party_sets):
-                if len(party) != self.party_set_size:
-                    print(f"  [WARN] Integrity check FAILED: party_{i+1} has {len(party)} IPs, expected {self.party_set_size}")
-                    return False
-            
-            # Validate IP structure
-            counts = self._item_counts(party_sets)
-            common_ips = [ip for ip, cnt in counts.items() if cnt == self.threshold]
-            if self.threshold == 1:
-                other_ips = [ip for ip, cnt in counts.items() if cnt != 1]
-            else:
-                other_ips = [ip for ip, cnt in counts.items() if cnt not in (1, self.threshold)]
-            
-            if self.threshold != 1 and len(common_ips) != self.num_common_ips:
-                print(f"  [WARN] Integrity check FAILED: Expected {self.num_common_ips} common IPs (at T={self.threshold}), found {len(common_ips)}")
-                return False
-            
-            if other_ips:
-                print(f"  [WARN] Integrity check FAILED: Found {len(other_ips)} IPs with invalid occurrence counts")
-                return False
-            
-            print(f"  [OK] Integrity check PASSED: {dataset_name} is valid")
-            return True
-            
-        except Exception as e:
-            print(f"  [WARN] Integrity check FAILED: {e}")
-            return False
-
     def _is_party_set_cache_valid(self) -> bool:
-        # Validate metadata first (parameter-level compatibility check).
         metadata = self._read_party_set_metadata()
         if metadata != self._current_party_set_metadata():
             return False
 
-        # Validate file count and expected names.
         expected_files = {
             os.path.join(self._dataset_dir(), f"party_{i + 1}.txt")
             for i in range(self.num_parties)
@@ -598,7 +272,6 @@ class ThresholdCircuit:
         if actual_files != expected_files:
             return False
 
-        # Validate each file has exactly party_set_size non-empty lines.
         ordered_files = sorted(actual_files)
         line_counts = [self._count_non_empty_lines(file_path) for file_path in ordered_files]
         if any(line_count != self.party_set_size for line_count in line_counts):
@@ -633,57 +306,108 @@ class ThresholdCircuit:
                 party_sets.append([line.strip() for line in fh if line.strip()])
         return party_sets
 
-    def load_or_create_party_sets(self, quiet: bool = False) -> list:
+    def load_or_create_party_sets(self) -> list:
         """
-        Return party sets from disk if they already exist, otherwise generate
-        them fresh, write them to disk, and return them.
+        [OPERATION]: Load existing party IP sets from disk, or generate and persist new ones.
         
-        No adaptation, no smart caching. Just generate based on parameters.
+        [PURPOSE]: Provides a single entry point for obtaining party sets with caching. 
+        Avoids regenerating datasets if they already exist with matching parameters.
+        Enables reproducibility and efficient reuse of generated data across runs.
+        
+        Parameters
+        ----------
+        None. Uses instance attributes (num_parties, threshold, party_set_size, etc.).
+        
+        Returns
+        -------
+        list of list of str
+            Party sets where each inner list contains IP addresses for one party.
+            Outer list has length num_parties; each inner list has length party_set_size.
+        
+        Notes
+        -----
+        - Dataset existence is determined by checking the party_sets/<dataset_tag>/ directory.
+        - If cache is valid (metadata matches current params and all N files exist), loads from disk.
+        - If cache is invalid or missing, clears old files and generates new party sets.
+        - Sets self._last_dataset_source to 'loaded' or 'created' for tracking.
         """
         # Quick cache check: if files already exist with correct metadata, load them
-        if self._is_party_set_cache_valid():
-            if not quiet:
-                print(f"  [OK] Loading cached {self._dataset_tag()}")
+        is_available = self._is_party_set_cache_valid()
+        self._last_dataset_source = "loaded" if is_available else "created"
+
+        print(
+            f"[INPUT] Dataset {self._dataset_tag()} : "
+            f"{'AVAILABLE' if is_available else 'NOT AVAILABLE'}"
+        )
+
+        if is_available:
+            print(f"[INPUT] Loading existing input files for {self._dataset_tag()}")
             existing = self._read_party_sets()
             if existing is not None:
                 return existing
 
         # Cache doesn't exist or is invalid: generate fresh based on parameters
-        if not quiet:
-            print(
-                f"  ├─ GENERATING fresh dataset\n"
-                f"  └─ TARGET: {self._dataset_tag()}"
-            )
+        print(f"[INPUT] Creating new input files for {self._dataset_tag()}")
         self._clear_party_set_cache()
         return self.generate_party_sets()
 
 
-    def build_bloom_filters_from_party_sets(self, party_sets: list, quiet: bool = False) -> list:
-        """Build Bloom filters directly from in-memory party sets (no Bloom-cache files)."""
-        if not quiet:
-            print(f"Building Bloom filters for '{self._dataset_tag()}' from party input files")
-        return [self.build_bloom_filter(party_set) for party_set in party_sets]
+    def build_bloom_filters_from_party_sets(self, party_sets: list) -> list:
+        """
+        [OPERATION]: Build Bloom filters from in-memory party IP sets (batch operation).
+        
+        [PURPOSE]: Converts all N party sets into their Bloom filter bit representations 
+        in a single batch. Convenience wrapper for repeated calls to build_bloom_filter().
+        
+        Parameters
+        ----------
+        party_sets : list of list of str
+            Party IP sets where outer list has length num_parties and each inner list 
+            contains IP addresses for one party.
+        
+        Returns
+        -------
+        list of list of int
+            Bloom filter bit arrays (one per party). Each inner list has length num_bloom_bits 
+            with elements 0 or 1.
+        
+        Notes
+        -----
+        - Calls build_bloom_filter() for each party sequentially.
+        - No caching; rebuilds filters even if they already exist.
+        - Prints progress indicating the dataset ID being processed.
+        ""
 
     def generate_party_sets(self) -> list:
         """
-        Generate N party IP sets with controlled intersection.
-
-        Process
-        -------
-          1. Create num_common_ips IP addresses and assign all of them to the
-              same threshold randomly chosen parties.
-        2. Fill every party's set with unique IPs until it reaches
-           party_set_size entries.
-        3. Write all sets to disk.
-
+        [OPERATION]: Generate N party IP sets with controlled intersection and write to disk.
+        
+        [PURPOSE]: Creates synthetic datasets for threshold-PSI testing where a known 
+        subset of IPs appears in exactly T parties, and remaining slots are filled with 
+        unique IPs. This enables controlled measurement of intersection accuracy.
+        
+        Parameters
+        ----------
+        None. Uses instance attributes (num_parties, threshold, party_set_size, num_common_ips).
+        
         Returns
         -------
-        list of sorted IP-address lists, one per party.
-        """
+        list of list of str
+            Generated party IP sets: outer list has length num_parties; 
+            each inner list contains party_set_size unique IPv4 addresses.
+        
+        Notes
+        -----
+        - Common IPs: Generates num_common_ips addresses and seeds them into 
+          threshold randomly-selected parties.
+        - Unique IPs: Fills remaining slots in each party with unique IPs 
+          from the IPv4 range [1.1.1.1, 254.254.254.254] (avoiding 0/255).
+        - Persistence: Writes each party set to party_sets/<dataset_tag>/party_N.txt 
+          and metadata to party_sets_meta.json.
+        ""
         party_sets = [set() for _ in range(self.num_parties)]
         used_ips: set = set()
 
-        # Seed common IPs into one fixed owner group of exactly T parties.
         common_ips = [
             self._random_unique_ip(used_ips) for _ in range(self.num_common_ips)
         ]
@@ -693,23 +417,132 @@ class ThresholdCircuit:
                 party_sets[party_idx].add(ip)
 
         # Fill remaining slots with unique IPs sequentially.
-        total_workload = self.num_parties * self.party_set_size
-        if total_workload >= 2_000_000:
-            print(
-                f"  [INFO] Large fresh generation path for {self._dataset_tag()} "
-                f"(N*S={total_workload:,})"
-            )
 
         for party_idx, party_set in enumerate(party_sets, start=1):
             while len(party_set) < self.party_set_size:
                 party_set.add(self._random_unique_ip(used_ips))
-            if total_workload >= 2_000_000:
-                print(f"  [INFO] Filled party {party_idx}/{self.num_parties}")
 
         party_lists = [list(s) for s in party_sets]
         self._write_party_sets(party_lists)
         self._write_party_set_metadata()
         return party_lists
+
+    def run_detailed_pipeline(self) -> dict:
+        """
+        [OPERATION]: Execute the complete end-to-end threshold-PSI workflow: data load, 
+        Bloom filter construction, circuit build, plaintext evaluation, encryption, 
+        encrypted evaluation, and decryption.
+        
+        [PURPOSE]: Provides a single orchestration point that runs all pipeline stages, 
+        measures execution time at each stage, and returns comprehensive results and metrics. 
+        Used for benchmarking and validating correctness.
+        
+        Parameters
+        ----------
+        None. Uses instance configuration (num_parties, threshold, etc.).
+        
+        Returns
+        -------
+        dict
+            Comprehensive pipeline result containing:
+            - 'party_sets': list of loaded/generated IP sets.
+            - 'bloom_filters': list of per-party Bloom filter bit arrays.
+            - 'canonical_circuit': full circuit before minimization (e.g., AB!C + A!BC + ABC).
+            - 'optimized_circuit': minimized SOP form (e.g., AB + AC + BC).
+            - 'plaintext_result': bit array from plaintext circuit evaluation.
+            - 'decrypted_result': bit array from encrypted evaluation (should match plaintext).
+            - 'encrypted_matches_plaintext': bool indicating correctness check result.
+            - 'timings': dict with keys load_dataset_time_s, build_bloom_filters_time_s, 
+              input_encryption_time_s, encrypted_computation_time_s, decryption_time_s, 
+              plaintext_computation_time_s, encrypted_computation_and_decryption_time_s, etc.
+            - 'dataset_source': 'loaded' or 'created' (from _last_dataset_source).
+        
+        Notes
+        -----
+        - All timing measurements use time.perf_counter() for precision.
+        - Plaintext result is the ground truth for correctness validation.
+        - Encrypted computation time includes per-bit encryption, evaluation, and aggregate overhead.
+        ""
+        timings = {
+            "load_dataset_time_s": None,
+            "build_bloom_filters_time_s": None,
+            "input_encryption_time_s": None,
+            "preprocessing_total_time_s": None,
+            "circuit_creation_time_s": None,
+            "plaintext_computation_time_s": None,
+            "encrypted_computation_and_decryption_time_s": None,
+            "encrypted_computation_time_s": None,
+            "decryption_time_s": None,
+        }
+
+        load_start = time.perf_counter()
+        party_sets = self.load_or_create_party_sets()
+        timings["load_dataset_time_s"] = time.perf_counter() - load_start
+
+        bloom_start = time.perf_counter()
+        bloom_filters = self.build_bloom_filters_from_party_sets(party_sets)
+        timings["build_bloom_filters_time_s"] = time.perf_counter() - bloom_start
+
+        circuit_start = time.perf_counter()
+        canonical_circuit = self.build_canonical_circuit()
+        optimized_circuit = self.optimize_circuit(canonical_circuit)
+        timings["circuit_creation_time_s"] = time.perf_counter() - circuit_start
+
+        plain_start = time.perf_counter()
+        plaintext_result = self.evaluate_plaintext_circuit(optimized_circuit, bloom_filters)
+        timings["plaintext_computation_time_s"] = time.perf_counter() - plain_start
+
+        decrypted_result = None
+        encrypt_inputs_elapsed = 0.0
+        encrypted_eval_elapsed = None
+        decryption_elapsed = None
+        encrypted_computation_plus_decryption_elapsed = None
+
+        enc_prep_start = time.perf_counter()
+        encrypted_bloom_filters = [
+            self.encrypt_bloom_filter(party_bloom_filter)
+            for party_bloom_filter in bloom_filters
+        ]
+        encrypt_inputs_elapsed = time.perf_counter() - enc_prep_start
+
+        enc_eval_start = time.perf_counter()
+        encrypted_result = self.evaluate_encrypted_circuit(
+            optimized_circuit,
+            encrypted_bloom_filters,
+        )
+        encrypted_eval_elapsed = time.perf_counter() - enc_eval_start
+
+        decrypt_start = time.perf_counter()
+        decrypted_result = self.decrypt_bloom_filter(encrypted_result)
+        decryption_elapsed = time.perf_counter() - decrypt_start
+        encrypted_computation_plus_decryption_elapsed = encrypted_eval_elapsed + decryption_elapsed
+        encrypted_matches_plaintext = decrypted_result == plaintext_result
+        print(
+            "[CHECK] Encrypted result matches plaintext: "
+            f"{'PASS' if encrypted_matches_plaintext else 'FAIL'}"
+        )
+
+        timings["input_encryption_time_s"] = encrypt_inputs_elapsed
+        timings["preprocessing_total_time_s"] = (
+            timings["load_dataset_time_s"]
+            + timings["build_bloom_filters_time_s"]
+            + timings["input_encryption_time_s"]
+        )
+        timings["encrypted_computation_time_s"] = encrypted_eval_elapsed
+        timings["decryption_time_s"] = decryption_elapsed
+        timings["encrypted_computation_and_decryption_time_s"] = encrypted_computation_plus_decryption_elapsed
+
+        return {
+            "dataset_source": getattr(self, "_last_dataset_source", "unknown"),
+            "party_sets": party_sets,
+            "bloom_filters": bloom_filters,
+            "canonical_circuit": canonical_circuit,
+            "optimized_circuit": optimized_circuit,
+            "plaintext_result": plaintext_result,
+            "decrypted_result": decrypted_result,
+            "encrypted_matches_plaintext": encrypted_matches_plaintext,
+            "timings": timings,
+        }
 
     # ------------------------------------------------------------------
     # Bloom filter layer
@@ -717,28 +550,46 @@ class ThresholdCircuit:
 
     def build_bloom_filter(self, party_set: list) -> list:
         """
-        Build a Bloom filter for party_set and return its contents as a flat
-        list of num_bloom_bits individual bits (each 0 or 1).
-
-        pyprobables stores the bit array as packed 32-bit integers; we unpack
-        them so that each position maps to a single bit, which is the format
-        required by both plaintext and encrypted circuit evaluation.
-        """
-        bf = BloomFilter(
+        [OPERATION]: Construct a Bloom filter from a party's IP set and return 
+        its unpacked bit array representation.
+        
+        [PURPOSE]: Converts a raw party IP set into a flat bit vector suitable for 
+        both plaintext and FHE encrypted circuit evaluation. Unpacking allows 
+        per-bit operations on encrypted data.
+        
+        Parameters
+        ----------
+        party_set : list of str
+            IPv4 addresses belonging to one party (e.g., ['1.2.3.4', '5.6.7.8', ...]).
+        
+        Returns
+        -------
+        list of int
+            Flattened Bloom filter bit array of length num_bloom_bits, 
+            where each element is 0 or 1.
+        
+        Notes
+        -----
+        - Internally uses pyprobables.BloomFilter with false_positive_rate 
+          and party_set_size parameters from instance.
+        - pyprobables stores bits as packed 32-bit integers; this function unpacks 
+          them into individual bits for FHE compatibility.
+        - Returned list is truncated to num_bloom_bits (first M bits only).
+        ""
+        bloom_filter = BloomFilter(
             est_elements=self.party_set_size,
             false_positive_rate=self.false_positive_rate,
         )
         for ip in party_set:
-            bf.add(ip)
-
-        # Unpack each chunk into individual bits using pyprobables' chunk width.
-        bits = []
-        for chunk in bf.bloom:
+            bloom_filter.add(ip)
+        
+        result_bits = []
+        for chunk in bloom_filter.bloom:
             for bit_pos in range(self._bits_per_chunk):
-                bits.append((chunk >> bit_pos) & 1)
-        return bits[: self.num_bloom_bits]
+                result_bits.append((chunk >> bit_pos) & 1)
+        return result_bits[: self.num_bloom_bits]
 
-    def _reconstruct_bloom_filter_from_bits(self, bits: list) -> BloomFilter:
+    def _reconstruct_bloom_filter_from_bits(self, bloom_filter_bits: list) -> BloomFilter:
         """Rebuild a pyprobables BloomFilter object from a flat bit list."""
         helper = BloomFilter(
             est_elements=self.party_set_size,
@@ -751,7 +602,7 @@ class ThresholdCircuit:
             base = chunk_idx * self._bits_per_chunk
             for bit_pos in range(self._bits_per_chunk):
                 bit_idx = base + bit_pos
-                if bit_idx < len(bits) and bits[bit_idx] == 1:
+                if bit_idx < len(bloom_filter_bits) and bloom_filter_bits[bit_idx] == 1:
                     chunk_val |= (1 << bit_pos)
             chunks.append(chunk_val)
 
@@ -764,19 +615,30 @@ class ThresholdCircuit:
 
     def build_canonical_circuit(self) -> str:
         """
-        Build the canonical threshold circuit for num_parties parties and threshold T.
-
-        Includes every minterm where at least T party literals are positive,
-        preserving a fixed alphabetical variable order.
-
-        Example (N=3, T=2): AB!C + A!BC + !ABC + ABC
-
+        [OPERATION]: Generate the full canonical SOP circuit including all minterms 
+        where at least T of N parties are active (positive literals).
+        
+        [PURPOSE]: Constructs the unoptimized boolean logic that encodes the threshold 
+        condition. Serves as input to optimize_circuit() for minimization.
+        
+        Parameters
+        ----------
+        None. Uses instance attributes (num_parties, threshold).
+        
         Returns
         -------
-        str  Sum-of-Products string in compact notation (e.g. AB!C).
-        """
-        if not (1 <= self.threshold <= self.num_parties):
-            raise ValueError("threshold T must satisfy 1 <= T <= N")
+        str
+            Canonical SOP string with all minterms, e.g., 'AB!C + A!BC + !ABC + ABC' 
+            for N=3, T=2. Variables are always in alphabetical order (A, B, C, ...).
+        
+        Notes
+        -----
+        - Generates C(N, k) minterms for each k >= T (number of active parties).
+        - Each minterm is a conjunction (AND) of all N variables, with negation 
+          for inactive parties (e.g., A AND NOT C).
+        - Result is verbose;  optimize_circuit() reduces it to minimal form.
+        - Example: N=3, T=2 has C(3,2)=3 + C(3,3)=1 = 4 minterms.
+        ""
 
         party_labels = [chr(ord("A") + i) for i in range(self.num_parties)]
         terms = []
@@ -794,35 +656,43 @@ class ThresholdCircuit:
 
     def optimize_circuit(self, circuit: str) -> str:
         """
-        Minimise a threshold circuit to its compact SOP form.
-
-        For a T-of-N threshold function the minimum SOP consists of all
-        C(N, T) combinations of exactly T positive literals  no negations
-        remain. This exploits the symmetric structure of threshold functions.
-
-        Example: AB!C + A!BC + !ABC + ABC  ->  AB + AC + BC
-
+        [OPERATION]: Minimize a canonical threshold circuit to minimal SOP form.
+        
+        [PURPOSE]: Reduces circuit complexity by exploiting the symmetric structure of 
+        threshold functions. Removes redundant terms, enabling faster FHE evaluation.
+        
         Parameters
         ----------
-        circuit : str  Canonical SOP string from build_canonical_circuit().
-
+        circuit : str
+            Canonical SOP circuit from build_canonical_circuit() 
+            (e.g., 'AB!C + A!BC + !ABC + ABC').
+        
         Returns
         -------
-        str  Optimised SOP string containing only positive literals.
-        """
+        str
+            Optimized SOP with only positive literals (e.g., 'AB + AC + BC'). 
+            For T-of-N threshold, result contains C(N, T) terms (all combinations of 
+            exactly T positive variables).
+        
+        Notes
+        -----
+        - Threshold functions are symmetric; minimal SOP is always C(N, T) positive-literal terms.
+        - Example: N=3, T=2 canonical 'AB!C + A!BC + !ABC + ABC' 
+          reduces to 'AB + AC + BC' (C(3,2) = 3 terms).
+        - All negations are removed in the optimized form.
+        - Parsing is robust: splits on '+' and handles whitespace.
+        ""
         terms = [t.strip() for t in circuit.split("+") if t.strip()]
         if not terms:
             return ""
 
-        # Collect all variable names.
-        variables = sorted({ch for term in terms for ch in term if ch.isalpha()})
+        variables = sorted({circuit_var for term in terms for circuit_var in term if circuit_var.isalpha()})
 
-        # Threshold = minimum number of positive literals in any single term.
         threshold = min(
             sum(
                 1
-                for pos, ch in enumerate(term)
-                if ch.isalpha() and (pos == 0 or term[pos - 1] != "!")
+                for pos, circuit_var in enumerate(term)
+                if circuit_var.isalpha() and (pos == 0 or term[pos - 1] != "!")
             )
             for term in terms
         )
@@ -832,27 +702,37 @@ class ThresholdCircuit:
         ]
         return " + ".join(optimized_terms)
 
-    def evaluate_plaintext_circuit(
-        self, circuit: str, bloom_filters: list
-    ) -> list:
+    def evaluate_plaintext_circuit(self, circuit: str, bloom_filters: list) -> list:
         """
-        Evaluate the optimised circuit over plaintext Bloom-filter bit arrays.
-
-        For each bit position the circuit AND/OR logic is applied across the
-        parties' bits. Used for testing and validation against the encrypted path.
-
+        [OPERATION]: Evaluate optimized SOP circuit logic over plaintext 
+        (unencrypted) Bloom filter bit arrays.
+        
+        [PURPOSE]: Computes the ground-truth intersection result. Used for correctness 
+        validation by comparing against encrypted evaluation results and for rapid 
+        prototyping without FHE overhead.
+        
         Parameters
         ----------
         circuit : str
-            Optimised SOP circuit (only positive literals), e.g. AB + AC + BC.
-        bloom_filters : list of lists
-            Raw bit arrays from build_bloom_filter(), one per party in
-            alphabetical order (index 0 = Party A, 1 = Party B, ).
-
+            Optimized SOP string with only positive literals (e.g., 'AB + AC + BC').
+        bloom_filters : list of list of int
+            Per-party Bloom filter bit arrays from build_bloom_filter(). 
+            Index 0 = Party A, index 1 = Party B, etc. (alphabetical order).
+        
         Returns
         -------
-        list of int  Result bit array of length num_bloom_bits.
-        """
+        list of int
+            Intersection result bit array of length num_bloom_bits. 
+            Each element is 0 or 1 indicating whether that bit satisfies the threshold.
+        
+        Notes
+        -----
+        - Parses circuit string by splitting on '+' to extract AND terms.
+        - For each term (e.g., 'ABC'), ANDs the bits from indexed parties; 
+          results are ORed together per bit position.
+        - Circuit variables are case-insensitive; 'A' = Party 0, 'B' = Party 1, etc.
+        - This is mathematically identical to encrypted evaluation but runs in plaintext.
+        ""
         terms = [t.strip() for t in circuit.split("+") if t.strip()]
         if not terms:
             return [0] * self.num_bloom_bits
@@ -863,77 +743,57 @@ class ThresholdCircuit:
             output_bit = 0
             for term in terms:
                 term_bit = 1
-                for ch in term:
-                    if ch.isalpha():
-                        party_idx = ord(ch.upper()) - ord("A")
+                for circuit_var in term:
+                    if circuit_var.isalpha():
+                        party_idx = ord(circuit_var.upper()) - ord("A")
                         term_bit &= bloom_filters[party_idx][bit_idx]
                 output_bit |= term_bit
             results.append(output_bit)
 
         return results
 
-    def benchmark_computation_times_from_party_sets(
-        self,
-        sample_bits_cap: int = 100_000,
-        include_encrypted: bool = True,
-        encrypted_sample_bits_cap: int = 256,
-        quiet: bool = False,
-    ) -> dict:
+    def benchmark_computation_times_from_party_sets(self) -> dict:
         """
-        Benchmark computation time using real generated/loaded party sets.
+        [OPERATION]: Run full pipeline and return timing breakdown across all stages.
+        
+        [PURPOSE]: Measures end-to-end and per-stage computation costs using real party sets. 
+        Essential for scalability analysis, performance comparison, and FHE overhead quantification.
+        
+        Parameters
+        ----------
+        None. Uses instance configuration and run_detailed_pipeline().
+        
+        Returns
+        -------
+        dict
+            Comprehensive metrics including:
+            - Timing keys: 'load_dataset_time_s', 'build_bloom_filters_time_s', 
+              'input_encryption_time_s', 'encrypted_computation_time_s', 
+              'decryption_time_s', 'plaintext_computation_time_s', 
+              'encrypted_computation_and_decryption_time_s', 'circuit_creation_time_s', 
+              'preprocessing_total_time_s'.
+            - Parameters: 'num_parties', 'threshold', 'num_common_ips', 'party_set_size', 
+              'num_bloom_bits'.
+            - Validation: 'encrypted_matches_plaintext' (bool).
+            - Context: 'dataset_source' ('loaded' or 'created').
+        
+        Notes
+        -----
+        - All timings are in seconds (float), measured with time.perf_counter().
+        - 'preprocessing_total_time_s' = sum(load + build_bloom_filters + input_encryption).
+        - 'encrypted_computation_and_decryption_time_s' = encrypted_computation + decryption.
+        - encrypted_matches_plaintext should be True for correct implementation.
+        ""
+        details = self.run_detailed_pipeline()
+        timings = details["timings"]
 
-        This path captures effects from data-generation parameters like
-        num_common_ips, unlike synthetic random bit generation.
-        """
-        prep_start = time.perf_counter()
-        party_sets = self.load_or_create_party_sets(quiet=quiet)
-        bloom_filters_full = self.build_bloom_filters_from_party_sets(party_sets, quiet=quiet)
-        prep_elapsed = time.perf_counter() - prep_start
-
-        sampled_bits = min(self.num_bloom_bits, sample_bits_cap)
-        bloom_filters = [bf[:sampled_bits] for bf in bloom_filters_full]
-
-        canonical_circuit = self.build_canonical_circuit()
-        optimized_circuit = self.optimize_circuit(canonical_circuit)
-
-        start_plain = time.perf_counter()
-        plain_result = self.evaluate_plaintext_circuit(optimized_circuit, bloom_filters)
-        plain_elapsed = time.perf_counter() - start_plain
-
-        encrypted_elapsed = None
-        encryption_elapsed = None
-        encrypted_eval_elapsed = None
-        decryption_elapsed = None
-        encrypted_match = None
-        encrypted_sampled_bits = min(sampled_bits, encrypted_sample_bits_cap)
-        if include_encrypted:
-            try:
-                start_encrypt = time.perf_counter()
-                encrypted_bloom_filters = [
-                    self.encrypt_bloom_filter(bits[:encrypted_sampled_bits])
-                    for bits in bloom_filters
-                ]
-                encryption_elapsed = time.perf_counter() - start_encrypt
-
-                start_eval = time.perf_counter()
-                enc_result = self.evaluate_encrypted_circuit(
-                    optimized_circuit,
-                    encrypted_bloom_filters,
-                )
-                encrypted_eval_elapsed = time.perf_counter() - start_eval
-
-                start_decrypt = time.perf_counter()
-                dec_result = self.decrypt_bloom_filter(enc_result)
-                decryption_elapsed = time.perf_counter() - start_decrypt
-
-                encrypted_elapsed = encryption_elapsed + encrypted_eval_elapsed + decryption_elapsed
-                encrypted_match = (dec_result == plain_result[:encrypted_sampled_bits])
-            except RuntimeError:
-                encrypted_elapsed = None
-                encryption_elapsed = None
-                encrypted_eval_elapsed = None
-                decryption_elapsed = None
-                encrypted_match = None
+        input_encryption_elapsed = timings["input_encryption_time_s"]
+        encrypted_computation_elapsed = timings["encrypted_computation_time_s"]
+        decryption_elapsed = timings["decryption_time_s"]
+        encrypted_compute_plus_decrypt_elapsed = timings["encrypted_computation_and_decryption_time_s"]
+        prep_elapsed = timings["preprocessing_total_time_s"]
+        plain_elapsed = timings["plaintext_computation_time_s"]
+        encrypted_match = details["encrypted_matches_plaintext"]
 
         return {
             "num_parties": self.num_parties,
@@ -941,17 +801,17 @@ class ThresholdCircuit:
             "num_common_ips": self.num_common_ips,
             "party_set_size": self.party_set_size,
             "num_bloom_bits": self.num_bloom_bits,
-            "sampled_bits": sampled_bits,
-            "encrypted_sampled_bits": encrypted_sampled_bits,
-            "preprocessing_time_s": prep_elapsed,
-            "plaintext_time_sampled_s": plain_elapsed,
-            "plaintext_time_measured_s": plain_elapsed,
-            "encrypted_time_sampled_s": encrypted_elapsed,
-            "encrypted_time_measured_s": encrypted_elapsed,
-            "encryption_time_sampled_s": encryption_elapsed,
-            "encrypted_eval_time_sampled_s": encrypted_eval_elapsed,
-            "decryption_time_sampled_s": decryption_elapsed,
+            "preprocessing_total_time_s": prep_elapsed,
+            "plaintext_computation_time_s": plain_elapsed,
+            "encrypted_computation_and_decryption_time_s": encrypted_compute_plus_decrypt_elapsed,
+            "input_encryption_time_s": input_encryption_elapsed,
+            "encrypted_computation_time_s": encrypted_computation_elapsed,
+            "decryption_time_s": decryption_elapsed,
             "encrypted_matches_plaintext": encrypted_match,
+            "dataset_source": details["dataset_source"],
+            "circuit_creation_time_s": timings["circuit_creation_time_s"],
+            "load_dataset_time_s": timings["load_dataset_time_s"],
+            "build_bloom_filters_time_s": timings["build_bloom_filters_time_s"],
         }
 
     # ------------------------------------------------------------------
@@ -959,15 +819,62 @@ class ThresholdCircuit:
     # ------------------------------------------------------------------
 
     def _parse_positive_sop_terms(self, circuit: str) -> list:
-        """Parse an optimised positive-literal SOP string into party-index terms."""
-        terms = [t.strip() for t in circuit.split("+") if t.strip()]
-        parsed = []
-        for term in terms:
-            parsed.append([ord(ch.upper()) - ord("A") for ch in term if ch.isalpha()])
-        return parsed
+        """
+        [OPERATION]: Parse an optimized SOP circuit string into lists of party indices.
+        
+        [PURPOSE]: Converts human-readable circuit string (e.g., 'AB + AC + BC') 
+        into machine-friendly format for FHE compilation. Enables concrete-python 
+        to build the threshold logic function.
+        
+        Parameters
+        ----------
+        circuit : str
+            Optimized SOP string with only positive literals (e.g., 'AB + AC + BC').
+        
+        Returns
+        -------
+        list of list of int
+            Parsed terms where each inner list contains party indices (0-based).
+            Example: 'AB + AC + BC' -> [[0, 1], [0, 2], [1, 2]] (for parties A=0, B=1, C=2).
+        
+        Notes
+        -----
+        - Splits circuit on '+' to extract individual AND terms.
+        - For each term, maps characters (A, B, C, ...) to 0-based indices.
+        - Output format is ready for _build_single_bit_threshold_compiler().
+        - Assumes circuit contains only uppercase letters (A-Z) as party labels.
+        ""
 
-    def _build_concrete_threshold_function(self, parsed_terms: list):
-        """Create a concrete-python compiled function for one bit position."""
+    def _build_single_bit_threshold_compiler(self, parsed_terms: list):
+        """
+        [OPERATION]: Create a concrete-python compiler function that evaluates 
+        threshold logic for a single Bloom filter bit position.
+        
+        [PURPOSE]: Builds the FHE circuit template that will be compiled and keygen'd 
+        once, then reused for per-bit encrypted evaluation. The returned compiler 
+        is decorated with @fhe.compiler to indicate encrypted inputs/outputs.
+        
+        Parameters
+        ----------
+        parsed_terms : list of list of int
+            Party index lists from _parse_positive_sop_terms(). 
+            Example: [[0, 1], [0, 2], [1, 2]] means (party0 AND party1) OR (party0 AND party2) OR ...
+        
+        Returns
+        -------
+        A concrete-python FHE compiler object (decorated function)
+            The compiler can be called with compiler.compile(inputset) 
+            to generate a compiled circuit, then compiled.keygen() to generate keys.
+        
+        Notes
+        -----
+        - The returned compiler is a function called bit_threshold(bits) that takes 
+          an encrypted array of party bits and returns one encrypted output bit.
+        - Logic: for each term, ANDs the bits from specified parties; ORs all results.
+        - Encryption is indicated by @fhe.compiler decorator and parameter {'bits': 'encrypted'}.
+        - The function uses arithmetic operations (*, +, -) to implement AND/OR 
+          on encrypted data (no branching allowed in FHE).
+        ""
 
         @fhe.compiler({"bits": "encrypted"})
         def bit_threshold(bits):
@@ -983,8 +890,32 @@ class ThresholdCircuit:
 
     def _init_fhe_context(self, circuit: str) -> None:
         """
-        Lazily compile and keygen a concrete-python bit-circuit for this SOP.
-        """
+        [OPERATION]: Lazily initialize and cache an FHE context (compiled circuit and keys) 
+        for a specific optimized SOP circuit.
+        
+        [PURPOSE]: Performs expensive one-time compilation and keygen operations per unique 
+        circuit. Caches results to avoid redundant compilation. Called automatically by 
+        evaluate_encrypted_circuit() before evaluation.
+        
+        Parameters
+        ----------
+        circuit : str
+            Optimized SOP circuit string (e.g., 'AB + AC + BC'). Used as cache key.
+        
+        Returns
+        -------
+        None. Side effects: Populates self._compiled_circuits[circuit] with compiled FHE context.
+        
+        Notes
+        -----
+        - On first call per circuit: parses circuit, builds compiler, compiles with binary inputset, 
+          and generates FHE keys.
+        - On subsequent calls: returns immediately (cache hit).
+        - Compilation time is significant (can be seconds). Caching prevents redundant work.
+        - Inputset: [array([0]*num_parties), array([1]*num_parties)] covers all binary boundary cases.
+        - Raises RuntimeError if concrete-python is not installed or keygen fails.
+        - Sets self._active_compiled_circuit for use by evaluate_encrypted_circuit() and decrypt_bloom_filter().
+        ""
         if not hasattr(self, "_compiled_circuits"):
             self._compiled_circuits = {}
 
@@ -993,7 +924,7 @@ class ThresholdCircuit:
 
         try:
             parsed_terms = self._parse_positive_sop_terms(circuit)
-            compiler = self._build_concrete_threshold_function(parsed_terms)
+            compiler = self._build_single_bit_threshold_compiler(parsed_terms)
             print(f"[FHE] Parsed {len(parsed_terms)} positive SOP terms for encrypted evaluation.")
 
             # Two boundary vectors are sufficient: inputs are strictly binary [0,1].
@@ -1001,11 +932,10 @@ class ThresholdCircuit:
                 np.array([0] * self.num_parties, dtype=np.int64),
                 np.array([1] * self.num_parties, dtype=np.int64),
             ]
-
-            with _LiveSpinner("Compiling Concrete circuit"):
-                compiled = compiler.compile(inputset)
-            with _LiveSpinner("Generating FHE keys"):
-                compiled.keygen()
+            print("[FHE] Compiling Concrete circuit...")
+            compiled = compiler.compile(inputset)
+            print("[FHE] Generating FHE keys...")
+            compiled.keygen()
             self._compiled_circuits[circuit] = compiled
             print("[FHE] Concrete circuit context is ready.")
         except Exception as exc:
@@ -1015,76 +945,104 @@ class ThresholdCircuit:
                 f"Underlying error: {exc}"
             ) from exc
 
-    def encrypt_bloom_filter(self, bits: list) -> np.ndarray:
+    def encrypt_bloom_filter(self, bloom_filter_bits: list) -> np.ndarray:
         """
-        Prepare a Bloom-filter bit array for concrete-python encrypted evaluation.
-
+        [OPERATION]: Convert Bloom filter bit array to numpy array for FHE encryption.
+        
+        [PURPOSE]: Prepares plaintext bits in the dense integer format required by 
+        concrete-python's encrypt() method. A lightweight conversion that enables 
+        downstream encrypted evaluation.
+        
         Parameters
         ----------
-        bits : list of int  Plain bit array from build_bloom_filter().
-
+        bloom_filter_bits : list of int
+            Plaintext Bloom filter bit array from build_bloom_filter(). 
+            Elements must be 0 or 1.
+        
         Returns
         -------
-        np.ndarray  Integer bit vector consumed by concrete-python encrypt() calls.
-        """
-        return np.array(bits, dtype=np.int64)
+        np.ndarray (dtype=int64)
+            Dense numpy array representation of bit array, ready for 
+            concrete-python encrypt() calls.
+        
+        Notes
+        -----
+        - This is a lightweight wrapper; no cryptographic operation occurs here.
+        - int64 dtype is required by concrete-python FHE API.
+        - Array is 1-D with length num_bloom_bits.
+        ""
+        return np.array(bloom_filter_bits, dtype=np.int64)
 
     def decrypt_bloom_filter(self, ciphertext: list) -> list:
         """
-        Decrypt a concrete-python encrypted bit-result list.
-
+        [OPERATION]: Decrypt a list of per-bit FHE ciphertexts to recover plaintext bits.
+        
+        [PURPOSE]: Recovers the final intersection result from encrypted computation. 
+        Enables validation against plaintext evaluation and extraction of candidate IPs.
+        
         Parameters
         ----------
-        ciphertext : list  Encrypted per-bit outputs returned by evaluate_encrypted_circuit.
-
+        ciphertext : list of encrypted values
+            Per-bit ciphertexts from evaluate_encrypted_circuit(). 
+            Length = num_bloom_bits. Each element is a concrete-python ciphertext.
+        
         Returns
         -------
-        list of int  Decrypted bit array.
-        """
+        list of int
+            Decrypted bit array of length num_bloom_bits, where each element is 0 or 1.
+        
+        Notes
+        -----
+        - Requires _active_compiled_circuit to be set (set by evaluate_encrypted_circuit()).
+        - Calls compiled.decrypt(ciphertext[i]) for each bit sequentially.
+        - Decryption is sequential (no parallelization) to avoid overhead.
+        - Result should match plaintext_result from evaluate_plaintext_circuit() if 
+          encrypted evaluation was correct.
+        ""
         if not hasattr(self, "_active_compiled_circuit"):
             raise RuntimeError("No active concrete-python circuit found for decryption.")
 
         compiled = self._active_compiled_circuit
-        progress = _LiveProgress("Decrypting result bits", len(ciphertext))
         decrypted = [0] * len(ciphertext)
-        completed = 0
 
-        def _decrypt_one(indexed_item):
-            idx, enc_bit = indexed_item
-            return idx, int(compiled.decrypt(enc_bit))
+        print(f"[FHE] Decrypting result bits ({len(ciphertext)} bits)...")
 
-        with ThreadPoolExecutor(max_workers=os.cpu_count()) as pool:
-            future_list = [pool.submit(_decrypt_one, item) for item in enumerate(ciphertext)]
-            for future in as_completed(future_list):
-                idx, value = future.result()
-                decrypted[idx] = value
-                completed += 1
-                progress.update(completed)
+        for idx, enc_bit in enumerate(ciphertext):
+            decrypted[idx] = int(compiled.decrypt(enc_bit))
 
-        progress.finish("decryption complete")
+        print("[FHE] Decryption complete")
         return decrypted
 
-    def evaluate_encrypted_circuit(
-        self,
-        circuit: str,
-        encrypted_bloom_filters: list,
-    ) -> list:
+    def evaluate_encrypted_circuit(self, circuit: str, encrypted_bloom_filters: list) -> list:
         """
-        Evaluate the optimised boolean circuit over encrypted Bloom filters
-        using concrete-python over one bit position at a time.
-
+        [OPERATION]: Evaluate optimized SOP circuit over encrypted Bloom filter bits 
+        using concrete-python FHE, performing one bit position at a time.
+        
+        [PURPOSE]: Computes intersection result while keeping all data encrypted end-to-end. 
+        Enables secure multi-party intersection without revealing intermediate values.
+        
         Parameters
         ----------
         circuit : str
-            Optimised SOP circuit (positive literals only), e.g. AB + AC + BC.
+            Optimized SOP circuit with only positive literals (e.g., 'AB + AC + BC').
         encrypted_bloom_filters : list of np.ndarray
-            Party bit arrays, one per party in alphabetical order.
-
+            Per-party encrypted Bloom filter bit arrays from encrypt_bloom_filter(). 
+            Index 0 = Party A, 1 = Party B, etc.
+        
         Returns
         -------
-        list
-            Encrypted per-bit outputs for the threshold intersection.
-        """
+        list of encrypted values
+            Ciphertext per-bit results (one ciphertext per bit position). 
+            Length = num_bloom_bits. Each element is a concrete-python ciphertext object.
+        
+        Notes
+        -----
+        - Lazily initializes FHE context (compilation and keygen) on first call per circuit via _init_fhe_context().
+        - Inner loop: for each bit position, assembles per-bit inputs as encrypted np.array, 
+          calls compiled.encrypt() and compiled.run() to evaluate.
+        - Uses the per-bit threshold compiler built by _build_single_bit_threshold_compiler().
+        - Result ciphertexts are later decrypted by decrypt_bloom_filter().
+        ""
         self._init_fhe_context(circuit)
         compiled = self._compiled_circuits[circuit]
         self._active_compiled_circuit = compiled
@@ -1097,37 +1055,50 @@ class ThresholdCircuit:
             return []
 
         results = [None] * bit_count
-        progress = _LiveProgress("Encrypting and evaluating Bloom bits", bit_count)
-        completed = 0
 
-        def _eval_bit(bit_idx: int):
+        print(f"[FHE] Encrypting and evaluating Bloom bits ({bit_count} bits)...")
+
+        for bit_idx in range(bit_count):
             bit_inputs = np.array(
                 [int(encrypted_bloom_filters[p][bit_idx]) for p in range(self.num_parties)],
                 dtype=np.int64,
             )
-            return compiled.run(compiled.encrypt(bit_inputs))
+            results[bit_idx] = compiled.run(compiled.encrypt(bit_inputs))
 
-        with ThreadPoolExecutor(max_workers=os.cpu_count()) as pool:
-            future_to_idx = {pool.submit(_eval_bit, i): i for i in range(bit_count)}
-            for future in as_completed(future_to_idx):
-                results[future_to_idx[future]] = future.result()
-                completed += 1
-                progress.update(completed)
-
-        progress.finish("encrypted evaluation complete")
+        print("[FHE] Encrypted evaluation complete")
         return results
 
-    def extract_candidates_from_intersection_bloom(
-        self, intersection_bits: list, party_sets: list
-    ) -> list:
+    def extract_candidates_from_intersection_bloom(self, intersection_bits: list, party_sets: list) -> list:
         """
-        Recover candidate elements from a decrypted intersection Bloom filter.
-
-        This checks every candidate in the union of party sets against the
-        decrypted intersection bloom bits using the same Bloom hash mapping.
-        Because Bloom filters are probabilistic, the output can include
-        false positives.
-        """
+        [OPERATION]: Recover candidate elements from decrypted intersection Bloom filter 
+        by checking all elements in the union against the final bit array.
+        
+        [PURPOSE]: Converts the encrypted intersection Bloom filter bits (binary result) 
+        back into candidate IP addresses. Used for validation and result extraction.
+        
+        Parameters
+        ----------
+        intersection_bits : list of int
+            Final decrypted Bloom filter bit array from decrypt_bloom_filter(). 
+            Length = num_bloom_bits; elements are 0 or 1.
+        party_sets : list of list of str
+            Original party IP sets (needed to recover the universe of candidates).
+        
+        Returns
+        -------
+        list of str
+            Candidate IP addresses that hash to 'set' bits in intersection_bits. 
+            May include false positives because Bloom filters are probabilistic.
+        
+        Notes
+        -----
+        - Universe is the sorted union of all IPs from all party sets.
+        - For each IP, reconstructs the Bloom filter object and checks if IP matches.
+        - Result can include false positives (Bloom filter property) but should not 
+          omit true positives.
+        - Extracted candidates should be close to exact_threshold_intersection() 
+          but may have extras due to false positives.
+        ""
         helper = self._reconstruct_bloom_filter_from_bits(intersection_bits)
 
         universe = sorted({ip for party in party_sets for ip in party})
@@ -1138,7 +1109,33 @@ class ThresholdCircuit:
         return candidates
 
     def exact_threshold_intersection(self, party_sets: list) -> list:
-        """Compute exact threshold intersection from plaintext party sets."""
+        """
+        [OPERATION]: Compute exact threshold intersection from plaintext party sets 
+        without using Bloom filters (exact set operation).
+        
+        [PURPOSE]: Provides ground-truth result (no false positives like Bloom filters). 
+        Used for validating Bloom-based intersection results and measuring false positive rate.
+        
+        Parameters
+        ----------
+        party_sets : list of list of str
+            Party IP sets where each inner list contains IPs for one party.
+        
+        Returns
+        -------
+        list of str
+            Sorted list of IPs that appear in at least T parties (exact result, 
+            no false positives).
+        
+        Notes
+        -----
+        - Counts IP occurrences across all parties (count = number of parties containing IP).
+        - Filters IPs where count >= threshold.
+        - Result is the mathematical set intersection at threshold level.
+        - Expensive operation (O(total_ips * num_parties)) but guarantees exactness.
+        - Should match extract_candidates_from_intersection_bloom() 
+          minus false positives from Bloom filter.
+        ""
         counts = {}
         for party in party_sets:
             for item in set(party):
@@ -1261,7 +1258,6 @@ def _expand_sequence_spec(spec, default_values):
 def run_scaling_experiments(
     false_positive_rate: float = 0.0005,
     max_parties: int = 10,
-    sample_bits_cap: int = 100_000,
     output_dir: str = "benchmark_outputs",
     scaling_sweeps: dict = None,
     only_sweep: str = "all",
@@ -1321,6 +1317,7 @@ def run_scaling_experiments(
         _t0 = time.perf_counter()
         parties_x, parties_plain, parties_enc = [], [], []
         parties_preenc, parties_eval, parties_dec = [], [], []
+        timing_rows = []
 
         parties_cfg = default_sweeps["parties"]
         parties_n_values = [
@@ -1352,30 +1349,39 @@ def run_scaling_experiments(
                 f"num_common_ips={parties_common_ips}, FPR={tc.false_positive_rate:.3e}"
             )
             print(f"        Calculated: M={tc.num_bloom_bits:,} bits, K={tc.num_hash_funcs} hash functions")
-            print("        Running benchmark", end="", flush=True)
+            print("        Stage order: input load/create -> bloom build -> encrypt -> circuit -> plaintext -> encrypted computation \+ decryption")
 
             _exp_start = time.perf_counter()
-            metrics = tc.benchmark_computation_times_from_party_sets(
-                sample_bits_cap=sample_bits_cap,
-                include_encrypted=True,
-                quiet=True,
-            )
+            metrics = tc.benchmark_computation_times_from_party_sets()
             _exp_time = time.perf_counter() - _exp_start
 
             parties_x.append(n)
-            parties_plain.append(metrics["plaintext_time_measured_s"])
-            parties_enc.append(metrics["encrypted_time_measured_s"])
-            parties_preenc.append(
-                None
-                if metrics["encryption_time_sampled_s"] is None
-                else metrics["preprocessing_time_s"] + metrics["encryption_time_sampled_s"]
+            parties_plain.append(metrics["plaintext_computation_time_s"])
+            parties_enc.append(metrics["encrypted_computation_and_decryption_time_s"])
+            parties_preenc.append(metrics["preprocessing_total_time_s"])
+            parties_eval.append(metrics["encrypted_computation_time_s"])
+            parties_dec.append(metrics["decryption_time_s"])
+            timing_rows.append(
+                {
+                    "run": f"N={n},T={t}",
+                    "dataset_source": metrics.get("dataset_source", "unknown"),
+                    "preprocessing_total_time_s": metrics.get("preprocessing_total_time_s"),
+                    "circuit_creation_time_s": metrics.get("circuit_creation_time_s"),
+                    "plaintext_computation_time_s": metrics.get("plaintext_computation_time_s"),
+                    "encrypted_computation_and_decryption_time_s": metrics.get("encrypted_computation_and_decryption_time_s"),
+                }
             )
-            parties_eval.append(metrics["encrypted_eval_time_sampled_s"])
-            parties_dec.append(metrics["decryption_time_sampled_s"])
             print(
-                f" done ({_exp_time:.2f}s)  |  "
-                f"plaintext: {metrics['plaintext_time_measured_s']:.3f}s, "
-                f"encrypted: {metrics['encrypted_time_measured_s']:.3f}s"
+                f"        Completed in {_exp_time:.2f}s | source={metrics.get('dataset_source', 'unknown')} | "
+                f"plaintext: {metrics['plaintext_computation_time_s']:.3f}s, "
+                f"encrypted: {metrics['encrypted_computation_and_decryption_time_s']:.3f}s"
+            )
+            print(
+                f"        Breakdown: load={_format_seconds(metrics.get('load_dataset_time_s'))}, "
+                f"bloom={_format_seconds(metrics.get('build_bloom_filters_time_s'))}, "
+                f"encrypt={_format_seconds(metrics.get('input_encryption_time_s'))}, "
+                f"enc_eval={_format_seconds(metrics.get('encrypted_computation_time_s'))}, "
+                f"decrypt={_format_seconds(metrics.get('decryption_time_s'))}"
             )
 
         print(f"\n[1/4] Parties sweep  done  ({time.perf_counter()-_t0:.1f}s)")
@@ -1396,11 +1402,13 @@ def run_scaling_experiments(
             x_label="Number of parties (N)",
             output_path=os.path.join(output_dir, "scaling_num_parties_encrypted_breakdown.png"),
         )
+        _render_timing_table("Timing Table - Parties Sweep", timing_rows)
 
     def _run_threshold_sweep():
         _t0 = time.perf_counter()
         threshold_x, threshold_plain, threshold_enc = [], [], []
         threshold_preenc, threshold_eval, threshold_dec = [], [], []
+        timing_rows = []
 
         threshold_cfg = default_sweeps["threshold"]
         fixed_set_size_for_threshold = int(threshold_cfg.get("party_set_size", 10**3))
@@ -1424,30 +1432,39 @@ def run_scaling_experiments(
                 f"num_common_ips={threshold_common_ips}, FPR={tc.false_positive_rate:.3e}"
             )
             print(f"        Calculated: M={tc.num_bloom_bits:,} bits, K={tc.num_hash_funcs} hash functions")
-            print("        Running benchmark", end="", flush=True)
+            print("        Stage order: input load/create -> bloom build -> encrypt -> circuit -> plaintext -> encrypted computation \+ decryption")
 
             _exp_start = time.perf_counter()
-            metrics = tc.benchmark_computation_times_from_party_sets(
-                sample_bits_cap=sample_bits_cap,
-                include_encrypted=True,
-                quiet=True,
-            )
+            metrics = tc.benchmark_computation_times_from_party_sets()
             _exp_time = time.perf_counter() - _exp_start
 
             threshold_x.append(t)
-            threshold_plain.append(metrics["plaintext_time_measured_s"])
-            threshold_enc.append(metrics["encrypted_time_measured_s"])
-            threshold_preenc.append(
-                None
-                if metrics["encryption_time_sampled_s"] is None
-                else metrics["preprocessing_time_s"] + metrics["encryption_time_sampled_s"]
+            threshold_plain.append(metrics["plaintext_computation_time_s"])
+            threshold_enc.append(metrics["encrypted_computation_and_decryption_time_s"])
+            threshold_preenc.append(metrics["preprocessing_total_time_s"])
+            threshold_eval.append(metrics["encrypted_computation_time_s"])
+            threshold_dec.append(metrics["decryption_time_s"])
+            timing_rows.append(
+                {
+                    "run": f"N={n_fixed},T={t}",
+                    "dataset_source": metrics.get("dataset_source", "unknown"),
+                    "preprocessing_total_time_s": metrics.get("preprocessing_total_time_s"),
+                    "circuit_creation_time_s": metrics.get("circuit_creation_time_s"),
+                    "plaintext_computation_time_s": metrics.get("plaintext_computation_time_s"),
+                    "encrypted_computation_and_decryption_time_s": metrics.get("encrypted_computation_and_decryption_time_s"),
+                }
             )
-            threshold_eval.append(metrics["encrypted_eval_time_sampled_s"])
-            threshold_dec.append(metrics["decryption_time_sampled_s"])
             print(
-                f" done ({_exp_time:.2f}s)  |  "
-                f"plaintext: {metrics['plaintext_time_measured_s']:.3f}s, "
-                f"encrypted: {metrics['encrypted_time_measured_s']:.3f}s"
+                f"        Completed in {_exp_time:.2f}s | source={metrics.get('dataset_source', 'unknown')} | "
+                f"plaintext: {metrics['plaintext_computation_time_s']:.3f}s, "
+                f"encrypted: {metrics['encrypted_computation_and_decryption_time_s']:.3f}s"
+            )
+            print(
+                f"        Breakdown: load={_format_seconds(metrics.get('load_dataset_time_s'))}, "
+                f"bloom={_format_seconds(metrics.get('build_bloom_filters_time_s'))}, "
+                f"encrypt={_format_seconds(metrics.get('input_encryption_time_s'))}, "
+                f"enc_eval={_format_seconds(metrics.get('encrypted_computation_time_s'))}, "
+                f"decrypt={_format_seconds(metrics.get('decryption_time_s'))}"
             )
 
         print(f"\n[2/4] Threshold sweep  done  ({time.perf_counter()-_t0:.1f}s)")
@@ -1468,6 +1485,7 @@ def run_scaling_experiments(
             x_label="Threshold (T)",
             output_path=os.path.join(output_dir, "scaling_threshold_encrypted_breakdown.png"),
         )
+        _render_timing_table("Timing Table - Threshold Sweep", timing_rows)
 
     def _run_set_size_sweep():
         _t0 = time.perf_counter()
@@ -1475,6 +1493,7 @@ def run_scaling_experiments(
         size_x = [int(v) for v in _expand_sequence_spec(size_cfg.get("set_sizes"), [10, 100, 1000])]
         size_plain, size_enc = [], []
         size_preenc, size_eval, size_dec = [], [], []
+        timing_rows = []
 
         n_for_size = int(size_cfg.get("num_parties", 10))
         t_for_size = int(size_cfg.get("threshold", 5))
@@ -1492,29 +1511,38 @@ def run_scaling_experiments(
             print(f"\n      [{i}/{len(size_x)}] Experiment: N={n_for_size}, T={t_for_size}, party_set_size={set_size:,}")
             print(f"        Parameters: num_common_ips={c_for_size}, FPR={tc.false_positive_rate:.3e}")
             print(f"        Calculated: M={tc.num_bloom_bits:,} bits, K={tc.num_hash_funcs} hash functions")
-            print("        Running benchmark", end="", flush=True)
+            print("        Stage order: input load/create -> bloom build -> encrypt -> circuit -> plaintext -> encrypted computation \+ decryption")
 
             _exp_start = time.perf_counter()
-            metrics = tc.benchmark_computation_times_from_party_sets(
-                sample_bits_cap=sample_bits_cap,
-                include_encrypted=True,
-                quiet=True,
-            )
+            metrics = tc.benchmark_computation_times_from_party_sets()
             _exp_time = time.perf_counter() - _exp_start
 
-            size_plain.append(metrics["plaintext_time_measured_s"])
-            size_enc.append(metrics["encrypted_time_measured_s"])
-            size_preenc.append(
-                None
-                if metrics["encryption_time_sampled_s"] is None
-                else metrics["preprocessing_time_s"] + metrics["encryption_time_sampled_s"]
+            size_plain.append(metrics["plaintext_computation_time_s"])
+            size_enc.append(metrics["encrypted_computation_and_decryption_time_s"])
+            size_preenc.append(metrics["preprocessing_total_time_s"])
+            size_eval.append(metrics["encrypted_computation_time_s"])
+            size_dec.append(metrics["decryption_time_s"])
+            timing_rows.append(
+                {
+                    "run": f"N={n_for_size},T={t_for_size},S={set_size}",
+                    "dataset_source": metrics.get("dataset_source", "unknown"),
+                    "preprocessing_total_time_s": metrics.get("preprocessing_total_time_s"),
+                    "circuit_creation_time_s": metrics.get("circuit_creation_time_s"),
+                    "plaintext_computation_time_s": metrics.get("plaintext_computation_time_s"),
+                    "encrypted_computation_and_decryption_time_s": metrics.get("encrypted_computation_and_decryption_time_s"),
+                }
             )
-            size_eval.append(metrics["encrypted_eval_time_sampled_s"])
-            size_dec.append(metrics["decryption_time_sampled_s"])
             print(
-                f" done ({_exp_time:.2f}s)  |  "
-                f"plaintext: {metrics['plaintext_time_measured_s']:.3f}s, "
-                f"encrypted: {metrics['encrypted_time_measured_s']:.3f}s"
+                f"        Completed in {_exp_time:.2f}s | source={metrics.get('dataset_source', 'unknown')} | "
+                f"plaintext: {metrics['plaintext_computation_time_s']:.3f}s, "
+                f"encrypted: {metrics['encrypted_computation_and_decryption_time_s']:.3f}s"
+            )
+            print(
+                f"        Breakdown: load={_format_seconds(metrics.get('load_dataset_time_s'))}, "
+                f"bloom={_format_seconds(metrics.get('build_bloom_filters_time_s'))}, "
+                f"encrypt={_format_seconds(metrics.get('input_encryption_time_s'))}, "
+                f"enc_eval={_format_seconds(metrics.get('encrypted_computation_time_s'))}, "
+                f"decrypt={_format_seconds(metrics.get('decryption_time_s'))}"
             )
 
         print(f"\n[3/4] Set-size sweep  done  ({time.perf_counter()-_t0:.1f}s)")
@@ -1535,6 +1563,7 @@ def run_scaling_experiments(
             x_label="Party set size",
             output_path=os.path.join(output_dir, "scaling_party_set_size_encrypted_breakdown.png"),
         )
+        _render_timing_table("Timing Table - Set-Size Sweep", timing_rows)
 
     def _run_common_ips_sweep():
         _t0 = time.perf_counter()
@@ -1542,6 +1571,7 @@ def run_scaling_experiments(
         common_x = [int(v) for v in _expand_sequence_spec(common_cfg.get("common_values"), [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000])]
         common_plain, common_enc = [], []
         common_preenc, common_eval, common_dec = [], [], []
+        timing_rows = []
 
         n_for_common = int(common_cfg.get("num_parties", 10))
         t_for_common = int(common_cfg.get("threshold", 5))
@@ -1560,29 +1590,38 @@ def run_scaling_experiments(
             print(f"\n      [{i}/{len(common_x)}] Experiment: N={n_for_common}, T={t_for_common}, num_common_ips={common_ips}")
             print(f"        Parameters: party_set_size={set_size_for_common:,}, FPR={tc.false_positive_rate:.3e}")
             print(f"        Calculated: M={tc.num_bloom_bits:,} bits, K={tc.num_hash_funcs} hash functions")
-            print("        Running benchmark", end="", flush=True)
+            print("        Stage order: input load/create -> bloom build -> encrypt -> circuit -> plaintext -> encrypted computation \+ decryption")
 
             _exp_start = time.perf_counter()
-            metrics = tc.benchmark_computation_times_from_party_sets(
-                sample_bits_cap=sample_bits_cap,
-                include_encrypted=True,
-                quiet=True,
-            )
+            metrics = tc.benchmark_computation_times_from_party_sets()
             _exp_time = time.perf_counter() - _exp_start
 
-            common_plain.append(metrics["plaintext_time_measured_s"])
-            common_enc.append(metrics["encrypted_time_measured_s"])
-            common_preenc.append(
-                None
-                if metrics["encryption_time_sampled_s"] is None
-                else metrics["preprocessing_time_s"] + metrics["encryption_time_sampled_s"]
+            common_plain.append(metrics["plaintext_computation_time_s"])
+            common_enc.append(metrics["encrypted_computation_and_decryption_time_s"])
+            common_preenc.append(metrics["preprocessing_total_time_s"])
+            common_eval.append(metrics["encrypted_computation_time_s"])
+            common_dec.append(metrics["decryption_time_s"])
+            timing_rows.append(
+                {
+                    "run": f"N={n_for_common},T={t_for_common},C={common_ips}",
+                    "dataset_source": metrics.get("dataset_source", "unknown"),
+                    "preprocessing_total_time_s": metrics.get("preprocessing_total_time_s"),
+                    "circuit_creation_time_s": metrics.get("circuit_creation_time_s"),
+                    "plaintext_computation_time_s": metrics.get("plaintext_computation_time_s"),
+                    "encrypted_computation_and_decryption_time_s": metrics.get("encrypted_computation_and_decryption_time_s"),
+                }
             )
-            common_eval.append(metrics["encrypted_eval_time_sampled_s"])
-            common_dec.append(metrics["decryption_time_sampled_s"])
             print(
-                f" done ({_exp_time:.2f}s)  |  "
-                f"plaintext: {metrics['plaintext_time_measured_s']:.3f}s, "
-                f"encrypted: {metrics['encrypted_time_measured_s']:.3f}s"
+                f"        Completed in {_exp_time:.2f}s | source={metrics.get('dataset_source', 'unknown')} | "
+                f"plaintext: {metrics['plaintext_computation_time_s']:.3f}s, "
+                f"encrypted: {metrics['encrypted_computation_and_decryption_time_s']:.3f}s"
+            )
+            print(
+                f"        Breakdown: load={_format_seconds(metrics.get('load_dataset_time_s'))}, "
+                f"bloom={_format_seconds(metrics.get('build_bloom_filters_time_s'))}, "
+                f"encrypt={_format_seconds(metrics.get('input_encryption_time_s'))}, "
+                f"enc_eval={_format_seconds(metrics.get('encrypted_computation_time_s'))}, "
+                f"decrypt={_format_seconds(metrics.get('decryption_time_s'))}"
             )
 
         print(f"\n[4/4] Common-IPs sweep  done  ({time.perf_counter()-_t0:.1f}s)")
@@ -1609,6 +1648,7 @@ def run_scaling_experiments(
             x_label="Number of common IPs",
             output_path=os.path.join(output_dir, "scaling_num_common_ips_encrypted_breakdown.png"),
         )
+        _render_timing_table("Timing Table - Common-IPs Sweep", timing_rows)
 
     # Execute selected sweeps
     if only_sweep == "all":
@@ -1677,27 +1717,41 @@ def prompt_sample_parameters(defaults: dict) -> dict:
 
 def run_sample_demo(config: dict) -> None:
     tc = ThresholdCircuit(**config)
-    print(f"\nDataset tag            = {tc._dataset_tag()}")
-    print(f"Bloom filter size      M = {tc.num_bloom_bits:,} bits")
-    print(f"Number of hash funcs   K = {tc.num_hash_funcs}")
-    print(f"False positive rate    target={tc.requested_false_positive_rate:.3e} (1/party_set_size), effective={tc.false_positive_rate:.3e}")
+    print("\n[RUN] Starting custom/sample execution")
+    print(f"[RUN] Configuration: N={tc.num_parties}, T={tc.threshold}, C={tc.num_common_ips}, S={tc.party_set_size}")
+    print(f"[RUN] Bloom filter size M={tc.num_bloom_bits:,} bits, hash functions K={tc.num_hash_funcs}")
+    print(
+        "[RUN] False positive rate "
+        f"target={tc.requested_false_positive_rate:.3e} (1/party_set_size), "
+        f"effective={tc.false_positive_rate:.3e}"
+    )
 
-    party_sets = tc.load_or_create_party_sets()
-    bloom_filters = tc.build_bloom_filters_from_party_sets(party_sets)
-    print(f"\nBuilt {len(bloom_filters)} Bloom filters  "
-          f"({tc.num_bloom_bits} bits each, K={tc.num_hash_funcs} hash functions, "
-            f"FPR={tc.false_positive_rate:.3e})")
+    details = tc.run_detailed_pipeline()
 
-    canonical_circuit = tc.build_canonical_circuit()
-    print(f"\nCanonical circuit: {canonical_circuit}")
+    party_sets = details["party_sets"]
+    bloom_filters = details["bloom_filters"]
+    canonical_circuit = details["canonical_circuit"]
+    optimized_circuit = details["optimized_circuit"]
+    plaintext_result = details["plaintext_result"]
+    decrypted_result = details["decrypted_result"]
+    timings = details["timings"]
 
-    optimized_circuit = tc.optimize_circuit(canonical_circuit)
-    print(f"Optimized circuit: {optimized_circuit}")
+    print(f"[RUN] Dataset source: {details['dataset_source']}")
+    print(f"[RUN] Party element counts: {[len(party) for party in party_sets]}")
+    print(
+        f"[RUN] Built {len(bloom_filters)} Bloom filters "
+        f"({tc.num_bloom_bits} bits each, K={tc.num_hash_funcs}, FPR={tc.false_positive_rate:.3e})"
+    )
+    for idx, bloom_filter in enumerate(bloom_filters, start=1):
+        print(f"[RUN] Bloom filter Party-{idx}: {bloom_filter}")
 
-    plaintext_result = tc.evaluate_plaintext_circuit(optimized_circuit, bloom_filters)
+    print(f"[RUN] Canonical circuit: {canonical_circuit}")
+    print(f"[RUN] Optimized circuit: {optimized_circuit}")
+
     ones_count = sum(plaintext_result)
     print(f"\nIntersection Bloom filter: {len(plaintext_result)} bits,  "
           f"{ones_count} set ({100*ones_count/len(plaintext_result):.1f}% density)")
+    print(f"[RUN] Plaintext intersection bits: {plaintext_result}")
 
     recovered_from_plain = tc.extract_candidates_from_intersection_bloom(
         plaintext_result,
@@ -1708,23 +1762,31 @@ def run_sample_demo(config: dict) -> None:
     print(f"Exact threshold intersection from plaintext sets: {exact_elements}")
 
     print("\n--- Concrete-Python Encrypted Evaluation ---")
-    try:
-        encrypted_bloom_filters = [tc.encrypt_bloom_filter(bits) for bits in bloom_filters]
-        encrypted_result = tc.evaluate_encrypted_circuit(
-            optimized_circuit,
-            encrypted_bloom_filters,
-        )
-        decrypted_result = tc.decrypt_bloom_filter(encrypted_result)
-        print(f"Decrypted result: {decrypted_result}")
+    if decrypted_result is None:
+        print("[RUN] Encrypted evaluation not available on this machine")
+    else:
+        print(f"[RUN] Decrypted intersection bits: {decrypted_result}")
         matches = decrypted_result == plaintext_result
-        print(f"Matches plaintext result: {matches}")
+        print(f"[RUN] Matches plaintext result: {matches}")
         recovered_candidates = tc.extract_candidates_from_intersection_bloom(
             decrypted_result,
             party_sets,
         )
-        print(f"Recovered candidates from decrypted bloom filter: {recovered_candidates}")
-    except RuntimeError as exc:
-        print(f"Concrete-python FHE unavailable on this machine: {exc}")
+        print(f"[RUN] Recovered candidates from decrypted bloom filter: {recovered_candidates}")
+
+    _render_timing_table(
+        "Timing Table - Custom Run",
+        [
+            {
+                "run": tc._dataset_tag(),
+                "dataset_source": details["dataset_source"],
+                "preprocessing_total_time_s": timings["preprocessing_total_time_s"],
+                "circuit_creation_time_s": timings["circuit_creation_time_s"],
+                "plaintext_computation_time_s": timings["plaintext_computation_time_s"],
+                "encrypted_computation_and_decryption_time_s": timings["encrypted_computation_and_decryption_time_s"],
+            }
+        ],
+    )
 
 
 def _print_prep_preflight_stats(ordered_configs: list, filtered_configs: list, skipped_count: int) -> None:
@@ -1873,7 +1935,7 @@ def prepare_input_files(sample_config: dict, scaling_config: dict) -> None:
 
     def _prepare_one(tc: ThresholdCircuit):
         started = time.perf_counter()
-        tc.load_or_create_party_sets(quiet=False)
+        tc.load_or_create_party_sets()
         return tc._dataset_tag(), (time.perf_counter() - started)
 
     total = len(ordered_configs)
@@ -1967,7 +2029,7 @@ def verify_single_dataset(dataset_name: str) -> None:
     if errors:
         print("\n[FAIL] Metadata mismatches:")
         for err in errors:
-            print(f"    └─ {err}")
+            print(f"    |- {err}")
     else:
         print("[OK] Metadata matches directory name")
     if expected_t == 1:
@@ -2000,7 +2062,7 @@ def verify_single_dataset(dataset_name: str) -> None:
         if size_errors:
             print("\n[FAIL] Party set size mismatches:")
             for err in size_errors:
-                print(f"    └─ {err}")
+                print(f"    |- {err}")
         else:
             print(f"[OK] All party sets have {expected_s} IPs")
         
@@ -2019,10 +2081,10 @@ def verify_single_dataset(dataset_name: str) -> None:
         
         print(f"\nIP Structure:")
         print(
-            f"  └─ Common IPs (appearing {expected_t} times): "
+            f"  |- Common IPs (appearing {expected_t} times): "
             f"{len(common_ips)} (expected {effective_expected_c})"
         )
-        print(f"  └─ Unique IPs (appearing 1 time): {len(unique_ips)}")
+        print(f"  |- Unique IPs (appearing 1 time): {len(unique_ips)}")
         
         if len(common_ips) != effective_expected_c:
             print(f"\n[FAIL] Common IP count mismatch: found {len(common_ips)}, expected {effective_expected_c}")
@@ -2037,9 +2099,9 @@ def verify_single_dataset(dataset_name: str) -> None:
                 print(f"    (Should only have counts of 1 or {expected_t})")
             for ip in invalid_ips[:5]:
                 cnt = ip_counts[ip]
-                print(f"    └─ {ip}: appears {cnt} times")
+                print(f"    |- {ip}: appears {cnt} times")
             if len(invalid_ips) > 5:
-                print(f"    └─  and {len(invalid_ips) - 5} more")
+                print(f"    |-  and {len(invalid_ips) - 5} more")
         else:
             print(f"[OK] All IPs have valid occurrence counts")
         
@@ -2247,7 +2309,7 @@ def verify_all_cached_datasets() -> None:
             if result["status"] == "FAIL":
                 print(f"[FAIL] {result['name']}")
                 for error in result["errors"]:
-                    print(f"    └─ {error}")
+                    print(f"    |- {error}")
                 print()
 
     print(f"{'='*70}")
@@ -2302,7 +2364,6 @@ def run_menu(sample_config: dict, scaling_config: dict) -> None:
                     scaling_config.get("false_positive_rate", sample_config.get("false_positive_rate", 0.0005))
                 ),
                 max_parties=int(scaling_config.get("max_parties", 10)),
-                sample_bits_cap=int(scaling_config.get("sample_bits_cap", 100_000)),
                 output_dir=str(scaling_config.get("output_dir", "benchmark_outputs")),
                 scaling_sweeps=scaling_config.get("scaling_sweeps"),
                 only_sweep=selected_sweep,
@@ -2323,77 +2384,30 @@ def run_menu(sample_config: dict, scaling_config: dict) -> None:
 
 
 def load_runtime_config() -> dict:
-    """Load or initialize configuration from party_sets directory."""
-    defaults = {
-        "script_mode": "circuit_tpsi",
-        "sample_config": {
-            "num_parties": 3,
-            "threshold": 2,
-            "false_positive_rate": 0.0005,
-            "num_common_ips": 5,
-            "party_set_size": 10**2,
-        },
-        "scaling_config": {
-            "false_positive_rate": 0.0005,
-            "max_parties": 10,
-            "sample_bits_cap": 100_000,
-            "output_dir": "benchmark_outputs",
-            "parallel_dataset_workers": 0,
-            "allow_unsafe_parallel_prep": False,
-            "skip_oversized_prep": False,
-            "max_prepare_workload": 0,
-            "scaling_sweeps": {
-                "parties": {
-                    "n_values": {"range": [2, 10]},
-                    "threshold_mode": "half",
-                    "party_set_size": 1000,
-                    "num_common_ips": 10
-                },
-                "threshold": {
-                    "n_fixed": 10,
-                    "t_values": {"range": "1..10"},
-                    "party_set_size": 1000,
-                    "num_common_ips": 10
-                },
-                "set_size": {
-                    "set_sizes": [10, 100, 1000],
-                    "num_parties": 10,
-                    "threshold": 5,
-                    "num_common_ips": 1
-                },
-                "common_ips": {
-                    "common_values": [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000],
-                    "num_parties": 10,
-                    "threshold": 5,
-                    "party_set_size": 1000
-                }
-            }
-        },
-    }
+    """Load runtime configuration strictly from party_sets/party_sets_meta.json."""
     os.makedirs(ThresholdCircuit.PARTY_SETS_DIR, exist_ok=True)
     config_path = os.path.join(
         ThresholdCircuit.PARTY_SETS_DIR,
         ThresholdCircuit.PARTY_SETS_META_FILE,
     )
 
-    config = defaults.copy()
-    if os.path.exists(config_path):
-        with open(config_path, "r") as fh:
-            existing = json.load(fh)
-        if isinstance(existing, dict):
-            config.update(existing)
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(
+            f"Runtime config file not found: {config_path}. "
+            "Please create it with 'sample_config' and 'scaling_config'."
+        )
 
-    sample_config = defaults["sample_config"].copy()
-    sample_config.update(config.get("sample_config", {}))
-    config["sample_config"] = sample_config
+    with open(config_path, "r") as fh:
+        config = json.load(fh)
 
-    scaling_config = defaults["scaling_config"].copy()
-    scaling_config.update(config.get("scaling_config", {}))
-    config["scaling_config"] = scaling_config
+    if not isinstance(config, dict):
+        raise ValueError("Runtime config must be a JSON object.")
+    if "sample_config" not in config or not isinstance(config["sample_config"], dict):
+        raise ValueError("Runtime config must include object field 'sample_config'.")
+    if "scaling_config" not in config or not isinstance(config["scaling_config"], dict):
+        raise ValueError("Runtime config must include object field 'scaling_config'.")
 
     config["script_mode"] = "circuit_tpsi"
-    with open(config_path, "w") as fh:
-        json.dump(config, fh, indent=2)
     return config
 
 
@@ -2402,10 +2416,14 @@ def load_runtime_config() -> dict:
 # ============================================================================
 
 if __name__ == "__main__":
+    log_path = setup_realtime_logging("party_sets/party_sets_runtime.log")
     runtime = load_runtime_config()
+    print(f"[INIT] Runtime config loaded from {os.path.join(ThresholdCircuit.PARTY_SETS_DIR, ThresholdCircuit.PARTY_SETS_META_FILE)}")
+    print(f"[INIT] Realtime append logging enabled at {log_path}")
     
     if USE_MENU:
         # Interactive menu mode
+        print("[INIT] Starting in interactive menu mode")
         run_menu(runtime["sample_config"], runtime["scaling_config"])
     else:
         # Standalone script mode - run sample demo and optionally scaling experiments
@@ -2424,7 +2442,6 @@ if __name__ == "__main__":
                 runtime["scaling_config"].get("false_positive_rate", 0.0005)
             ),
             max_parties=int(runtime["scaling_config"].get("max_parties", 10)),
-            sample_bits_cap=int(runtime["scaling_config"].get("sample_bits_cap", 100_000)),
             output_dir=str(runtime["scaling_config"].get("output_dir", "benchmark_outputs")),
             scaling_sweeps=runtime["scaling_config"].get("scaling_sweeps"),
             only_sweep="all",
@@ -2433,4 +2450,6 @@ if __name__ == "__main__":
         print("\n" + "="*60)
         print("All operations completed successfully!")
         print("="*60)
+
+
 
