@@ -1,5 +1,5 @@
-# Core dependencies for Threshold PSI Circuit
+# Core dependencies for the threshold PSI circuit and Final_Results plots
 numpy>=1.20.0
 pyprobables>=0.5.0
 matplotlib>=3.5.0
-concrete-python>=0.3.0  # FHE evaluation (optional - scripts work without it)
+openfhe  # Platform-specific OpenFHE Python wheel for threshold BFV evaluation

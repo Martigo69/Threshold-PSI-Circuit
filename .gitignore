@@ -2,4 +2,11 @@ __pycache__/
 *.py[cod]
 party_sets/*
 !party_sets/party_sets_meta.json
+Final_Results/*.log
+Final_Results/graph.py
+Final_Results/pivot_tables.txt
+TODO.txt
+todo.txt
+slurmjob.sh
+slurmjob_threshold_circuit.sh
 *.Zone.Identifier
