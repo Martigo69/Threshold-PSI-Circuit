@@ -117,4 +117,4 @@ Key values include:
 
 ## License
 
-No license file is included. Add one if you want to publish or share the project under explicit terms.
+This project is licensed under the MIT License. See [LICENSE](LICENSE) for the full text.
